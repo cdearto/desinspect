@@ -46,8 +46,6 @@
     <div class="tabs" role="tablist">
       <button data-tab="styles" class="tab active" role="tab" aria-selected="true">Styles</button>
       <button data-tab="computed" class="tab" role="tab">Computed</button>
-      <button data-tab="box" class="tab" role="tab">Box</button>
-      <button data-tab="html" class="tab" role="tab">HTML</button>
       <button data-tab="changes" class="tab" role="tab">Changes <span id="changes-badge" class="badge"></span></button>
       <button data-tab="snapshots" class="tab" role="tab">Snapshots</button>
     </div>
@@ -64,29 +62,15 @@
       </div>
 
       <div class="tab-panel" data-panel="computed">
+        <div id="box" class="box-wrap">
+          <div class="empty">No selection.</div>
+        </div>
         <div class="filter-row">
           <input id="computed-filter" type="text" placeholder="Filter" />
           <label class="check"><input id="computed-show-all" type="checkbox" /> show all</label>
         </div>
         <div id="computed" class="computed-list">
           <div class="empty">No selection.</div>
-        </div>
-      </div>
-
-      <div class="tab-panel" data-panel="box">
-        <div id="box" class="box-wrap">
-          <div class="empty">No selection.</div>
-        </div>
-      </div>
-
-      <div class="tab-panel" data-panel="html">
-        <div class="filter-row">
-          <span class="muted">Edit outerHTML</span>
-          <button id="btn-apply-html" class="link-btn primary">Apply (⌘↵)</button>
-        </div>
-        <div class="html-editor-wrap">
-          <pre id="html-highlight" class="html-highlight" aria-hidden="true"></pre>
-          <textarea id="html-editor" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Select an element..."></textarea>
         </div>
       </div>
 

@@ -23,7 +23,6 @@
     changes: [],                // current URL's persisted changes
     snapshots: [],
     activeTab: 'styles',
-    pendingHtmlOriginal: null,
     undoStack: [],              // panel-side; mirrors changes for ⌘Z
     redoStack: [],
   };
@@ -518,7 +517,6 @@
       renderStyles();
       renderComputed();
       renderBox();
-      renderHtml();
       return;
     }
     setStatus(state.selected.value);
@@ -527,7 +525,6 @@
     renderStyles();
     renderComputed();
     renderBox();
-    renderHtml();
   }
 
   // ─── Styles tab ─────────────────────────────────────────────────────────
@@ -1044,139 +1041,6 @@
     `;
   }
 
-  // ─── HTML tab ───────────────────────────────────────────────────────────
-
-  function renderHtml() {
-    const ta = document.getElementById('html-editor');
-    if (!state.selectedInfo) {
-      ta.value = '';
-      ta.placeholder = 'Select an element to edit its HTML.';
-      ta.disabled = true;
-      paintHtmlHighlight('');
-      return;
-    }
-    ta.disabled = false;
-    const raw = state.selectedInfo.outerHTML || '';
-    const pretty = prettyHtml(raw);
-    ta.value = pretty;
-    state.pendingHtmlOriginal = raw;
-    paintHtmlHighlight(pretty);
-  }
-
-  function paintHtmlHighlight(text) {
-    const target = document.getElementById('html-highlight');
-    if (!target) return;
-    target.innerHTML = highlightHtml(text) + '\n'; // trailing newline so caret at EOL has a line to land on
-  }
-
-  /**
-   * Tokenize a chunk of HTML into colored spans. Handles tags, attributes,
-   * comments, and text content. Output is HTML; the caller injects it as
-   * innerHTML of the highlight overlay.
-   */
-  function highlightHtml(src) {
-    if (!src) return '';
-    let out = '';
-    let i = 0;
-    const n = src.length;
-    while (i < n) {
-      const ch = src[i];
-      if (ch === '<') {
-        // comment
-        if (src.startsWith('<!--', i)) {
-          const end = src.indexOf('-->', i + 4);
-          const stop = end === -1 ? n : end + 3;
-          out += `<span class="hl-comment">${escapeHtml(src.slice(i, stop))}</span>`;
-          i = stop;
-          continue;
-        }
-        // doctype / cdata
-        if (src.startsWith('<!', i)) {
-          const end = src.indexOf('>', i);
-          const stop = end === -1 ? n : end + 1;
-          out += `<span class="hl-doctype">${escapeHtml(src.slice(i, stop))}</span>`;
-          i = stop;
-          continue;
-        }
-        // tag
-        const end = src.indexOf('>', i);
-        if (end === -1) {
-          out += escapeHtml(src.slice(i));
-          break;
-        }
-        out += colorizeTag(src.slice(i, end + 1));
-        i = end + 1;
-        continue;
-      }
-      // text run
-      const next = src.indexOf('<', i);
-      const stop = next === -1 ? n : next;
-      const chunk = src.slice(i, stop);
-      if (chunk) out += `<span class="hl-text">${escapeHtml(chunk)}</span>`;
-      i = stop;
-    }
-    return out;
-  }
-
-  function colorizeTag(raw) {
-    // raw looks like '<tag attr="v">' or '</tag>' or '<tag/>'
-    const closing = raw.startsWith('</');
-    const inner = raw.slice(closing ? 2 : 1, -1);
-    const selfClose = inner.endsWith('/');
-    const body = selfClose ? inner.slice(0, -1) : inner;
-
-    const nameMatch = body.match(/^[A-Za-z][\w:-]*/);
-    if (!nameMatch) return escapeHtml(raw);
-    const tagName = nameMatch[0];
-    let rest = body.slice(tagName.length);
-
-    let out = `<span class="hl-bracket">&lt;${closing ? '/' : ''}</span>`;
-    out += `<span class="hl-tag">${escapeHtml(tagName)}</span>`;
-
-    // Attributes: name, optional =value
-    const attrRe = /(\s+)([A-Za-z_:][\w:.-]*)(\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/g;
-    let lastIdx = 0;
-    let m;
-    while ((m = attrRe.exec(rest)) !== null) {
-      // Any unmatched chars before this match
-      out += escapeHtml(rest.slice(lastIdx, m.index));
-      out += escapeHtml(m[1]); // whitespace
-      out += `<span class="hl-attr-name">${escapeHtml(m[2])}</span>`;
-      if (m[3]) {
-        // split eq from value
-        const eqValue = m[3];
-        const eqMatch = eqValue.match(/^(\s*=\s*)([\s\S]*)$/);
-        if (eqMatch) {
-          out += `<span class="hl-eq">${escapeHtml(eqMatch[1])}</span>`;
-          out += `<span class="hl-attr-value">${escapeHtml(eqMatch[2])}</span>`;
-        } else {
-          out += escapeHtml(eqValue);
-        }
-      }
-      lastIdx = attrRe.lastIndex;
-    }
-    out += escapeHtml(rest.slice(lastIdx));
-    out += `<span class="hl-bracket">${selfClose ? '/' : ''}&gt;</span>`;
-    return out;
-  }
-
-  async function applyHtml() {
-    const ta = document.getElementById('html-editor');
-    if (!state.selected) return;
-    const v = ta.value;
-    await send('APPLY_HTML', {
-      payload: {
-        selector: state.selected,
-        value: v,
-        originalValue: state.pendingHtmlOriginal,
-        elementLabel: state.selected.value,
-      },
-    });
-    await loadChanges();
-    await loadElementInfo();
-    setStatus('HTML applied');
-  }
-
   // Simple HTML pretty-printer. Uses the browser's parser, then walks the
   // tree and emits indented markup. Stays self-contained — no js-beautify.
   function prettyHtml(html, indent = '  ') {
@@ -1380,35 +1244,6 @@
   document.getElementById('style-filter').addEventListener('input', renderStyles);
   document.getElementById('computed-filter').addEventListener('input', renderComputed);
   document.getElementById('computed-show-all').addEventListener('change', renderComputed);
-  document.getElementById('btn-apply-html').addEventListener('click', applyHtml);
-
-  // HTML editor: keep highlight overlay in sync with text + scroll.
-  (() => {
-    const ta = document.getElementById('html-editor');
-    const hl = document.getElementById('html-highlight');
-    ta.addEventListener('input', () => paintHtmlHighlight(ta.value));
-    ta.addEventListener('scroll', () => {
-      hl.scrollTop = ta.scrollTop;
-      hl.scrollLeft = ta.scrollLeft;
-    });
-    ta.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-        e.preventDefault();
-        applyHtml();
-        return;
-      }
-      // Tab inserts two spaces instead of moving focus
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const indent = '  ';
-        ta.value = ta.value.slice(0, start) + indent + ta.value.slice(end);
-        ta.selectionStart = ta.selectionEnd = start + indent.length;
-        paintHtmlHighlight(ta.value);
-      }
-    });
-  })();
 
   // Resizable split
   const resizer = document.getElementById('resizer');
