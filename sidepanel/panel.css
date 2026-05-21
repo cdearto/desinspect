@@ -253,6 +253,46 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   padding-left: 14px;
 }
 
+/* Inline outerHTML editor (double-click on a tree row) */
+.tree-row.editing {
+  background: var(--bg-alt);
+  cursor: default;
+  display: flex;
+  align-items: stretch;
+  padding: 4px 8px;
+}
+.tree-edit-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tree-edit-textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 6px 8px;
+  resize: vertical;
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  tab-size: 2;
+}
+.tree-edit-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 10px;
+}
+
 /* ─── Tabs ──────────────────────────────────────────────────────────────── */
 
 .tabs {

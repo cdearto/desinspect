@@ -193,6 +193,11 @@
       loadElementInfo();
       highlightTreeSelection();
     });
+    row.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      startInlineHtmlEdit(node, row);
+    });
 
     wrap.appendChild(row);
 
@@ -309,6 +314,127 @@
     const span = document.createElement('span');
     span.innerHTML = `<span class="tree-close">&lt;/</span><span class="tree-tag">${node.tag}</span><span class="tree-close">&gt;</span>`;
     return span;
+  }
+
+  /**
+   * Double-click handler on a tree row: swap the row contents for an inline
+   * outerHTML editor. Enter (or ⌘↵) commits, Esc cancels.
+   */
+  async function startInlineHtmlEdit(node, row) {
+    // Don't double-trigger if already editing this row
+    if (row.classList.contains('editing')) return;
+
+    const info = await send('GET_ELEMENT_INFO', { selector: node.selector });
+    if (!info || !info.outerHTML) {
+      setStatus("Couldn't load outerHTML for this element.");
+      return;
+    }
+    const raw = info.outerHTML;
+    const pretty = prettyHtml(raw);
+
+    // Stash the original row markup so we can restore on cancel
+    const original = row.innerHTML;
+    row.classList.add('editing');
+    row.innerHTML = '';
+
+    const indent = document.createElement('span');
+    indent.className = 'tree-indent';
+    // Match the depth of the row being replaced (best-effort: copy from sibling)
+    // The row in the tree carries no depth attribute, so we just leave 0 indent.
+    row.appendChild(indent);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'tree-edit-wrap';
+    const ta = document.createElement('textarea');
+    ta.className = 'tree-edit-textarea';
+    ta.value = pretty;
+    ta.spellcheck = false;
+    ta.rows = Math.min(20, Math.max(3, pretty.split('\n').length));
+    wrap.appendChild(ta);
+
+    const actions = document.createElement('div');
+    actions.className = 'tree-edit-actions';
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'link-btn primary';
+    applyBtn.textContent = 'Apply (↵)';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'link-btn';
+    cancelBtn.textContent = 'Cancel (Esc)';
+    actions.appendChild(applyBtn);
+    actions.appendChild(cancelBtn);
+    wrap.appendChild(actions);
+    row.appendChild(wrap);
+
+    ta.focus();
+    ta.select();
+
+    let done = false;
+    const cancel = () => {
+      if (done) return;
+      done = true;
+      row.classList.remove('editing');
+      row.innerHTML = original;
+    };
+    const commit = async () => {
+      if (done) return;
+      done = true;
+      const newHtml = ta.value;
+      if (newHtml.trim() === pretty.trim() || newHtml.trim() === raw.trim()) {
+        // no change
+        row.classList.remove('editing');
+        row.innerHTML = original;
+        return;
+      }
+      row.classList.remove('editing');
+      row.innerHTML = original;
+      await send('APPLY_HTML', {
+        payload: {
+          selector: node.selector,
+          value: newHtml,
+          originalValue: raw,
+          elementLabel: node.selector.value,
+        },
+      });
+      await loadChanges();
+      // The replaced element may have a different selector now; re-fetch
+      // the tree and reload element info if it was selected.
+      await refreshTreeRoot();
+      if (state.selected) {
+        await loadElementInfo();
+        revealInTree(state.selected);
+      }
+      setStatus('HTML applied');
+    };
+
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        cancel();
+      } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        commit();
+      }
+    });
+    applyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      commit();
+    });
+    cancelBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      cancel();
+    });
+    // Clicking outside the edit area cancels (unless they hit Apply)
+    const onDocClick = (e) => {
+      if (done) {
+        document.removeEventListener('mousedown', onDocClick, true);
+        return;
+      }
+      if (!row.contains(e.target)) {
+        document.removeEventListener('mousedown', onDocClick, true);
+        cancel();
+      }
+    };
+    setTimeout(() => document.addEventListener('mousedown', onDocClick, true), 0);
   }
 
   function highlightTreeSelection() {
