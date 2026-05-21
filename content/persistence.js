@@ -260,6 +260,14 @@ const Persistence = (() => {
   }
 
   async function deleteChange(id) {
+    // Cancel any in-flight debounced save for this id. Without this, a CSS
+    // edit's pending timer would fire after we've deleted the record and
+    // resurrect it in IndexedDB — re-checking a property would appear to
+    // "do nothing" because the next reapply re-reads the disabled record.
+    if (_saveTimers.has(id)) {
+      clearTimeout(_saveTimers.get(id));
+      _saveTimers.delete(id);
+    }
     const record = _cache.get(id) || (await PersistDB.getChange(id));
     if (!record) return;
     _cache.delete(id);
@@ -281,6 +289,10 @@ const Persistence = (() => {
   }
 
   async function clearAll() {
+    // Cancel any pending debounced saves before wiping IndexedDB, otherwise
+    // they'd resurrect deleted records after the timer fires.
+    for (const t of _saveTimers.values()) clearTimeout(t);
+    _saveTimers.clear();
     const n = await PersistDB.clearChangesForUrl(_currentUrl);
     const sheet = getStylesheet();
     while (sheet.cssRules.length) sheet.deleteRule(0);
