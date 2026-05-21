@@ -400,6 +400,15 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   white-space: nowrap;
   padding-left: 8px;
 }
+.rule-pseudo {
+  color: var(--warning);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 0 6px;
+  background: rgba(249, 168, 37, 0.12);
+  border-radius: 2px;
+  margin-left: 4px;
+}
 .rule-body {
   padding: 0 8px 0 8px;
 }

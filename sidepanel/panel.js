@@ -585,6 +585,7 @@
       rules.push({
         kind: r.origin === 'desinspect' ? 'override' : 'rule',
         selector: r.selector,
+        pseudo: r.pseudo || null,
         source: r.origin === 'desinspect' ? 'DesInspect edit' : r.source,
         properties: r.properties.map((p) =>
           r.origin === 'desinspect' ? { ...p, edited: true } : p
@@ -621,6 +622,13 @@
     selSpan.className = 'rule-selector' + (rule.kind === 'inline' ? ' inline' : '');
     selSpan.textContent = rule.selector;
     head.appendChild(selSpan);
+    if (rule.pseudo) {
+      const pseudo = document.createElement('span');
+      pseudo.className = 'rule-pseudo';
+      pseudo.textContent = rule.pseudo;
+      pseudo.title = 'Applies only in this state';
+      head.appendChild(pseudo);
+    }
     if (rule.source) {
       const src = document.createElement('span');
       src.className = 'rule-source';

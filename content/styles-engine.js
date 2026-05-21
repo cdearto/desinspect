@@ -73,58 +73,104 @@ const StylesEngine = (() => {
     };
   }
 
+  // Dynamic pseudo-classes / pseudo-elements that depend on user state and
+  // shouldn't gate visibility in the Styles panel — DevTools shows these
+  // rules even when the element isn't currently in that state.
+  const DYNAMIC_PSEUDOS = [
+    'hover', 'focus', 'focus-visible', 'focus-within', 'active', 'visited',
+    'link', 'disabled', 'enabled', 'checked', 'indeterminate', 'default',
+    'placeholder-shown', 'autofill', 'read-only', 'read-write',
+    'valid', 'invalid', 'in-range', 'out-of-range', 'required', 'optional',
+    'user-invalid', 'target', 'scope', 'host', 'fullscreen',
+  ];
+  const DYNAMIC_RE = new RegExp(`:(?:${DYNAMIC_PSEUDOS.join('|')})(?:\\([^)]*\\))?`, 'gi');
+  const PSEUDO_ELEMENT_RE = /::[a-zA-Z-]+(?:\([^)]*\))?/g;
+
+  function stripDynamicPseudos(selector) {
+    return selector.replace(DYNAMIC_RE, '').replace(PSEUDO_ELEMENT_RE, '').trim();
+  }
+  function pseudoLabelFor(selector) {
+    const m = selector.match(/(:{1,2}[a-zA-Z-]+(?:\([^)]*\))?)/g);
+    if (!m) return null;
+    // Return only dynamic ones, joined
+    const dyn = m.filter((p) => {
+      const name = p.replace(/^:+/, '').replace(/\(.*$/, '');
+      return DYNAMIC_PSEUDOS.includes(name) || p.startsWith('::');
+    });
+    return dyn.length ? dyn.join('') : null;
+  }
+
+  function tryMatch(el, selector) {
+    try { return el.matches(selector); } catch { return false; }
+  }
+
+  /**
+   * Does `el` match `selector` either directly, or with dynamic pseudos
+   * stripped? Returns { match, pseudo } where pseudo is the stripped part
+   * (e.g. ':hover', '::before') or null.
+   */
+  function matchPossiblyWithPseudo(el, selector) {
+    if (tryMatch(el, selector)) return { match: true, pseudo: null };
+    const stripped = stripDynamicPseudos(selector);
+    if (!stripped || stripped === selector) return { match: false, pseudo: null };
+    if (tryMatch(el, stripped)) {
+      return { match: true, pseudo: pseudoLabelFor(selector) };
+    }
+    return { match: false, pseudo: null };
+  }
+
+  function pushStyleRule(out, rule, el, sheet, src, mediaSuffix) {
+    const { match, pseudo } = matchPossiblyWithPseudo(el, rule.selectorText);
+    if (!match) return;
+    out.push({
+      kind: 'rule',
+      selector: rule.selectorText,
+      pseudo,
+      source: mediaSuffix ? `${src} ${mediaSuffix}` : src,
+      origin: sheet.ownerNode?.id === 'desinspect-overrides' ? 'desinspect' : 'author',
+      properties: parseProps(rule.cssText),
+    });
+  }
+
   function matchedRules(el) {
     const out = [];
     for (const sheet of Array.from(document.styleSheets)) {
       const rules = safeRules(sheet);
       if (!rules) continue;
       const src = sheetSource(sheet);
-      for (const rule of Array.from(rules)) {
-        // Style rule
-        if (rule.type === 1 || rule.constructor.name === 'CSSStyleRule') {
-          let matches = false;
-          try {
-            matches = el.matches(rule.selectorText);
-          } catch {
-            matches = false;
-          }
-          if (matches) {
-            out.push({
-              kind: 'rule',
-              selector: rule.selectorText,
-              source: src,
-              origin: sheet.ownerNode?.id === 'desinspect-overrides' ? 'desinspect' : 'author',
-              properties: parseProps(rule.cssText),
-            });
-          }
-        } else if (rule.type === 4 || rule.constructor.name === 'CSSMediaRule') {
-          // @media — only include if currently matching
-          let media = null;
-          try {
-            media = rule.media?.mediaText;
-          } catch {}
-          if (media && !window.matchMedia(media).matches) continue;
-          for (const inner of Array.from(rule.cssRules || [])) {
-            if (inner.type === 1) {
-              let m = false;
-              try {
-                m = el.matches(inner.selectorText);
-              } catch {}
-              if (m) {
-                out.push({
-                  kind: 'rule',
-                  selector: inner.selectorText,
-                  source: `${src} @media ${media}`,
-                  origin: 'author',
-                  properties: parseProps(inner.cssText),
-                });
-              }
-            }
-          }
-        }
-      }
+      walkRules(out, rules, el, sheet, src, '');
     }
     return out;
+  }
+
+  function walkRules(out, rules, el, sheet, src, mediaSuffix) {
+    for (const rule of Array.from(rules)) {
+      // CSSStyleRule
+      if (rule.type === 1 || rule.constructor.name === 'CSSStyleRule') {
+        pushStyleRule(out, rule, el, sheet, src, mediaSuffix);
+        continue;
+      }
+      // CSSMediaRule — recurse if it currently applies
+      if (rule.type === 4 || rule.constructor.name === 'CSSMediaRule') {
+        let media = null;
+        try { media = rule.media?.mediaText; } catch {}
+        if (media && !window.matchMedia(media).matches) continue;
+        walkRules(out, rule.cssRules || [], el, sheet, src, media ? `@media ${media}` : mediaSuffix);
+        continue;
+      }
+      // CSSSupportsRule — recurse if supported
+      if (rule.constructor.name === 'CSSSupportsRule') {
+        let cond = null;
+        try { cond = rule.conditionText; } catch {}
+        if (cond && typeof CSS !== 'undefined' && CSS.supports && !CSS.supports(cond)) continue;
+        walkRules(out, rule.cssRules || [], el, sheet, src, mediaSuffix);
+        continue;
+      }
+      // CSSLayerBlockRule, CSSContainerRule, etc. — recurse if they have nested rules
+      if (rule.cssRules && rule.cssRules.length) {
+        walkRules(out, rule.cssRules, el, sheet, src, mediaSuffix);
+      }
+    }
   }
 
   function computedSnapshot(el) {

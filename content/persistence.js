@@ -13,6 +13,15 @@ const Persistence = (() => {
   let _saveTimers = new Map();
   let _cache = new Map(); // id → record (in-memory mirror)
 
+  // When we mutate the DOM ourselves (e.g. outerHTML replace), the page's
+  // MutationObserver would otherwise re-fire reapply() in a loop. Mark a
+  // short settle window after each of our applies and let the MO ignore
+  // anything within it.
+  let _suppressUntil = 0;
+  function markOurMutation(ms = 800) {
+    _suppressUntil = Math.max(_suppressUntil, Date.now() + ms);
+  }
+
   function getStylesheet() {
     let el = document.getElementById(STYLESHEET_ID);
     if (!el) {
@@ -114,8 +123,14 @@ const Persistence = (() => {
    * Apply a saved record to the live DOM.
    */
   function applyRecord(record) {
-    if (record.property === '__html__') return applyHtmlChange(record);
-    if (record.property === '__remove__') return applyRemoveChange(record);
+    if (record.property === '__html__') {
+      markOurMutation();
+      return applyHtmlChange(record);
+    }
+    if (record.property === '__remove__') {
+      markOurMutation();
+      return applyRemoveChange(record);
+    }
     // CSS rule selectors only work in stylesheets; XPath has to go inline.
     if (record.selectorType === 'xpath') return applyInlineStyle(record);
     applyRuleToSheet(record);
@@ -151,9 +166,11 @@ const Persistence = (() => {
     window.addEventListener('popstate', onNav);
 
     // Watch for DOM mutations on persistent SPAs: if a selector wasn't
-    // present at first re-apply, retry after the DOM settles.
+    // present at first re-apply, retry after the DOM settles. Skip if the
+    // most recent mutations were ours (markOurMutation).
     const mo = new MutationObserver(
       debounce(() => {
+        if (Date.now() < _suppressUntil) return;
         reapply({ silent: true });
       }, 500)
     );
@@ -189,7 +206,9 @@ const Persistence = (() => {
   }
 
   /**
-   * Save (debounced) and apply immediately.
+   * Save and apply. CSS edits debounce (high frequency during typing); HTML
+   * and element-removal edits flush immediately so a quick refresh doesn't
+   * lose them.
    */
   function saveChange(input) {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
@@ -202,6 +221,19 @@ const Persistence = (() => {
     };
     _cache.set(id, record);
     applyRecord(record);
+
+    const flushImmediately =
+      input.property === '__html__' || input.property === '__remove__';
+    if (flushImmediately) {
+      if (_saveTimers.has(id)) {
+        clearTimeout(_saveTimers.get(id));
+        _saveTimers.delete(id);
+      }
+      PersistDB.putChange(record)
+        .then(() => notifyPanel('CHANGE_SAVED', { id }))
+        .catch((err) => console.error('[DesInspect] save failed:', err));
+      return record;
+    }
 
     if (_saveTimers.has(id)) clearTimeout(_saveTimers.get(id));
     _saveTimers.set(
