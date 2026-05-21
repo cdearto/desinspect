@@ -93,7 +93,7 @@ const StylesEngine = (() => {
               kind: 'rule',
               selector: rule.selectorText,
               source: src,
-              origin: sheet.ownerNode?.id === 'desinspect-rule-overrides' ? 'desinspect' : 'author',
+              origin: sheet.ownerNode?.id === 'desinspect-overrides' ? 'desinspect' : 'author',
               properties: parseProps(rule.cssText),
             });
           }

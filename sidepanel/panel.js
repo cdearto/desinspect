@@ -658,47 +658,69 @@
     cb.checked = true;
     row.appendChild(cb);
 
-    const name = document.createElement('span');
-    name.className = 'prop-name';
-    name.contentEditable = 'true';
-    name.textContent = 'property';
-    row.appendChild(name);
+    const nameIn = document.createElement('input');
+    nameIn.className = 'prop-name prop-edit-input';
+    nameIn.placeholder = 'property';
+    nameIn.spellcheck = false;
+    nameIn.autocomplete = 'off';
+    row.appendChild(nameIn);
 
     const colon = document.createElement('span');
     colon.className = 'prop-colon';
     colon.textContent = ': ';
     row.appendChild(colon);
 
-    const val = document.createElement('span');
-    val.className = 'prop-value';
-    val.contentEditable = 'true';
-    val.textContent = 'value';
-    row.appendChild(val);
+    const valIn = document.createElement('input');
+    valIn.className = 'prop-value prop-edit-input';
+    valIn.placeholder = 'value';
+    valIn.spellcheck = false;
+    valIn.autocomplete = 'off';
+    row.appendChild(valIn);
 
     addRow.parentElement.insertBefore(row, addRow);
-    name.focus();
-    document.execCommand('selectAll', false, null);
+    nameIn.focus();
 
     let committed = false;
     const commit = () => {
       if (committed) return;
       committed = true;
-      const n = (name.textContent || '').trim().toLowerCase();
-      const v = (val.textContent || '').trim();
-      if (!n || !v || n === 'property') { row.remove(); return; }
+      const n = nameIn.value.trim().toLowerCase();
+      const v = valIn.value.trim();
+      if (!n || !v) { row.remove(); return; }
       saveStyleEdit(rule, n, v, false);
     };
-    const onNameKey = (e) => {
-      if (e.key === 'Tab' || e.key === 'Enter') { e.preventDefault(); val.focus(); document.execCommand('selectAll', false, null); }
-      if (e.key === 'Escape') { row.remove(); }
+    const cancel = () => { committed = true; row.remove(); };
+
+    nameIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab' || e.key === 'Enter' || e.key === ':') {
+        e.preventDefault();
+        valIn.focus();
+        valIn.select();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancel();
+      }
+    });
+    valIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancel();
+      }
+    });
+    // Commit on blur if user clicks away after entering both fields
+    const onBlur = () => {
+      setTimeout(() => {
+        if (committed) return;
+        if (document.activeElement === nameIn || document.activeElement === valIn) return;
+        if (nameIn.value.trim() && valIn.value.trim()) commit();
+        else cancel();
+      }, 0);
     };
-    const onValueKey = (e) => {
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); val.blur(); commit(); }
-      if (e.key === 'Escape') { row.remove(); }
-    };
-    name.addEventListener('keydown', onNameKey);
-    val.addEventListener('keydown', onValueKey);
-    val.addEventListener('blur', () => setTimeout(commit, 0));
+    nameIn.addEventListener('blur', onBlur);
+    valIn.addEventListener('blur', onBlur);
   }
 
   async function saveStyleEdit(rule, property, value, isDelete) {
@@ -893,8 +915,10 @@
       return;
     }
     ta.disabled = false;
-    ta.value = state.selectedInfo.innerHTML || '';
-    state.pendingHtmlOriginal = state.selectedInfo.innerHTML || '';
+    const raw = state.selectedInfo.outerHTML || '';
+    const pretty = prettyHtml(raw);
+    ta.value = pretty;
+    state.pendingHtmlOriginal = raw;
   }
 
   async function applyHtml() {
@@ -910,9 +934,59 @@
       },
     });
     await loadChanges();
-    // Refresh element info — innerHTML changed, child tree may differ
     await loadElementInfo();
     setStatus('HTML applied');
+  }
+
+  // Simple HTML pretty-printer. Uses the browser's parser, then walks the
+  // tree and emits indented markup. Stays self-contained — no js-beautify.
+  function prettyHtml(html, indent = '  ') {
+    if (!html) return '';
+    const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+    const INLINE_SHORT = 80;
+    const tmpl = document.createElement('template');
+    tmpl.innerHTML = html.trim();
+    function attrs(el) {
+      return Array.from(el.attributes)
+        .map((a) => ` ${a.name}="${(a.value || '').replace(/"/g, '&quot;')}"`)
+        .join('');
+    }
+    function emit(node, depth) {
+      const pad = indent.repeat(depth);
+      if (node.nodeType === 3) {
+        const t = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        return t ? pad + t + '\n' : '';
+      }
+      if (node.nodeType === 8) {
+        return pad + '<!--' + node.nodeValue + '-->\n';
+      }
+      if (node.nodeType !== 1) return '';
+      const tag = node.tagName.toLowerCase();
+      const a = attrs(node);
+      if (VOID.has(tag)) {
+        return `${pad}<${tag}${a}>\n`;
+      }
+      const children = Array.from(node.childNodes);
+      if (children.length === 0) {
+        return `${pad}<${tag}${a}></${tag}>\n`;
+      }
+      if (
+        children.length === 1 &&
+        children[0].nodeType === 3 &&
+        (children[0].textContent || '').replace(/\s+/g, ' ').trim().length < INLINE_SHORT &&
+        !children[0].textContent.includes('\n')
+      ) {
+        const text = (children[0].textContent || '').replace(/\s+/g, ' ').trim();
+        return `${pad}<${tag}${a}>${text}</${tag}>\n`;
+      }
+      let out = `${pad}<${tag}${a}>\n`;
+      for (const c of children) out += emit(c, depth + 1);
+      out += `${pad}</${tag}>\n`;
+      return out;
+    }
+    let out = '';
+    for (const c of tmpl.content.childNodes) out += emit(c, 0);
+    return out.trimEnd();
   }
 
   // ─── Changes tab ────────────────────────────────────────────────────────

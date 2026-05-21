@@ -75,7 +75,21 @@ const Persistence = (() => {
   function applyHtmlChange(record) {
     const el = SelectorEngine.find({ type: record.selectorType, value: record.selector });
     if (!el) return false;
-    el.innerHTML = record.value;
+    // The value is the outerHTML of the new element. outerHTML assignment
+    // replaces the node entirely; if the new markup is a parse error,
+    // fall back to innerHTML so we don't blow up the document.
+    try {
+      const tmpl = document.createElement('template');
+      tmpl.innerHTML = record.value;
+      const newEl = tmpl.content.firstElementChild;
+      if (newEl) {
+        el.replaceWith(newEl);
+        return true;
+      }
+      el.innerHTML = record.value;
+    } catch {
+      el.innerHTML = record.value;
+    }
     return true;
   }
 

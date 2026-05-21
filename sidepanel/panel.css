@@ -408,6 +408,20 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   outline: 1px solid var(--accent);
   background: var(--bg-alt);
 }
+.prop-edit-input {
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  min-width: 60px;
+  max-width: 160px;
+  outline: none;
+}
+.prop-edit-input.prop-name { color: var(--prop-name); flex: 0 0 auto; }
+.prop-edit-input.prop-value { color: var(--prop-value); flex: 1; min-width: 80px; }
 .prop-important { color: var(--warning); font-size: 10px; }
 .prop-color-swatch {
   display: inline-block;
