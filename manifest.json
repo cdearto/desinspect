@@ -1,19 +1,18 @@
 {
   "manifest_version": 3,
   "name": "DesInspect",
-  "version": "0.2.1",
-  "description": "Persistent browser element inspector with auto-save. Never lose your CSS/HTML tweaks again.",
+  "version": "0.3.1",
+  "description": "Chrome-DevTools-style element inspector with persistent edits. Tweak any page's CSS/HTML and your changes survive refresh, login, and SPA navigation.",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
+    "scripting",
     "storage",
     "sidePanel",
-    "scripting",
     "webNavigation"
   ],
   "host_permissions": [
-    "<all_urls>",
-    "https://api.anthropic.com/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background/service-worker.js"
@@ -25,17 +24,16 @@
     {
       "matches": ["<all_urls>"],
       "js": [
-        "utils/dom-serializer.js",
         "storage/local-db.js",
-        "content/selector-engine.js",
-        "content/change-tracker.js",
-        "content/overlay-renderer.js",
+        "content/selector.js",
+        "content/persistence.js",
+        "content/styles-engine.js",
+        "content/overlay.js",
         "content/inspector.js"
       ],
-      "css": [
-        "styles/content.css"
-      ],
-      "run_at": "document_idle"
+      "css": ["styles/content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "action": {
