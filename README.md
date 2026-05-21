@@ -1,116 +1,81 @@
 # DesInspect
 
-> A persistent browser element inspector with auto-save. Never lose your CSS/HTML tweaks again.
+> A persistent, Chrome-DevTools-style element inspector for any webpage. Edit CSS or HTML, refresh, log in, navigate — your work survives.
 
-DesInspect is a Chrome extension (Manifest V3) that turns any webpage into a live design playground. Click an element, tweak its CSS or HTML in the side panel, and your changes are automatically persisted in IndexedDB — surviving page refreshes, navigation, and browser restarts. Optional AI-powered UX audits via Claude.
+DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools Elements panel inside the browser's side panel, then quietly writes every edit to IndexedDB scoped to the page's URL. When you come back — after a refresh, a re-login, or an SPA route change — your tweaks are still there.
 
 ## Features
 
-- **Click-to-inspect** any element on any page — hover to highlight, click to select
-- **Live CSS editing** — DevTools-style style panel with filter, class toggle, and add-rule
-- **HTML editing** — edit inner HTML with line numbers, Tab indentation, and `Cmd/Ctrl+Enter` to apply
-- **Persistent auto-save** — every change is written to IndexedDB and re-applied on next visit
-- **URL-scoped changes** — edits on one page don't leak to another
-- **Box model diagram** — Chrome DevTools-style margin/border/padding/content visualizer
-- **DOM Navigator** — vertical tree showing ancestors, siblings, and children of the selected element with hover-to-highlight
-- **Diff mode** — flip between original and modified states on the live page for before/after comparison
-- **Undo/redo** — `Cmd/Ctrl+Z` and `Cmd/Ctrl+Shift+Z`, up to 100 levels deep
-- **Snapshots** — named checkpoints of your full changeset (like git commits for browser edits)
-- **Export** — copy changes as clean CSS, or export the full changeset as JSON
-- **SPA-aware** — detects `pushState`/`replaceState`/`popstate` and re-applies changes after client-side navigation
-- **AI UX Audit** (optional) — runs accessibility/usability checks on the selected element or full page via the Anthropic API. Costs <$0.01 per audit. API key is stored locally and only sent to `api.anthropic.com`.
-- **AI Helper** (optional) — natural-language CSS/HTML edits ("make this bigger", "add more padding")
+- **DevTools-style sidepanel**: collapsible DOM tree on top, tabbed inspector below (Styles · Computed · Box · HTML · Changes · Snapshots).
+- **Styles tab** with matched author rules, inline `element.style`, click-to-edit names/values, checkbox toggle per property, color swatches, and `+ add property` / `+ New rule`.
+- **Box-model diagram** showing margin / border / padding / content for the selected element.
+- **HTML editor** — edit innerHTML and apply with `Cmd/Ctrl + Enter`.
+- **Pick mode** — hover the page to highlight, click to select. ESC exits.
+- **Persistent auto-save** — every edit lands in IndexedDB, scoped to `origin + pathname`. Cleared session? Page refresh? Your work is re-applied automatically.
+- **SPA-aware** — hooks `pushState` / `replaceState` / `popstate` and `webNavigation` so your edits re-apply after client-side route changes.
+- **Snapshots** — named save points of the full changeset, restorable in one click.
 
-## Install
+## Install (unpacked)
 
-This is an unpacked Chrome extension. To install:
+1. Clone this repo.
+2. Open `chrome://extensions` (Chrome 116+).
+3. Toggle **Developer mode** on.
+4. Click **Load unpacked**, select this directory.
+5. Pin the toolbar icon.
 
-1. Clone this repo:
-   ```bash
-   git clone https://github.com/cdearto/desinspect.git
-   ```
-2. Open `chrome://extensions` in Chrome (requires Chrome 116+).
-3. Toggle **Developer mode** on (top right).
-4. Click **Load unpacked** and select the cloned `desinspect` directory.
-5. Pin the DesInspect icon to your toolbar for easy access.
+## Use
 
-## Usage
-
-1. Navigate to any page you want to modify.
-2. Click the DesInspect toolbar icon — this opens the side panel and activates inspector mode.
-3. Hover any element to highlight it; click to select.
-4. Edit CSS properties or switch to **HTML** mode to edit markup directly.
-5. Changes auto-save and re-apply on every revisit to the same URL.
+1. Open any page.
+2. Click the DesInspect toolbar icon — the side panel opens.
+3. Hit **Pick** (or just expand the DOM tree) and click an element.
+4. Edit styles in the **Styles** tab, edit markup in **HTML**, or check the **Box** model.
+5. Refresh — your edits are still there.
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| `Cmd/Ctrl + Z` | Undo |
-| `Cmd/Ctrl + Shift + Z` | Redo |
-| `Delete` / `Backspace` | Remove selected element |
-| `Esc` | Deselect element / deactivate inspector |
-| `Tab` / `Shift+Tab` | Indent / outdent in HTML editor |
 | `Cmd/Ctrl + Enter` | Apply HTML edit |
+| `Enter` (in style row) | Commit edit |
+| `Tab` (in style name) | Jump to value |
+| `Esc` | Cancel inline edit / exit picker |
 
-### AI UX Audit setup
-
-1. Get an Anthropic API key at [console.anthropic.com](https://console.anthropic.com/settings/keys).
-2. In the side panel, switch to the **AI UX Audit** tab.
-3. Paste your key and click **Save**. The key is stored locally in `chrome.storage` and is only sent to `api.anthropic.com`.
-4. Use **Audit Page**, **Audit Selected Element**, or **Check Change Impact**.
-
-A **Test Mode** is available that uses mock data — no API key needed.
-
-## Project structure
+## Architecture
 
 ```
-desinspect/
-├── manifest.json              # Chrome MV3 manifest
-├── background/
-│   └── service-worker.js      # Message router, tab/SPA navigation handling
-├── content/
-│   ├── inspector.js           # Main orchestrator (click/hover/select logic)
-│   ├── change-tracker.js      # Records, persists, and re-applies changes
-│   ├── selector-engine.js     # Generates robust CSS selectors / XPaths
-│   └── overlay-renderer.js    # Highlight overlays on the page
-├── sidepanel/
-│   ├── index.html             # Side panel UI (Editor / Changes / Audit / History tabs)
-│   ├── panel.js               # Panel logic
-│   └── panel.css              # Panel styling
-├── ai/
-│   ├── audit-engine.js        # Anthropic API client + audit orchestration
-│   └── prompt-templates.js    # Prompts for audit and natural-language edits
-├── storage/
-│   └── local-db.js            # IndexedDB wrapper (PersistDB)
-├── utils/
-│   ├── dom-serializer.js      # Compute styles / inline styles / describe elements
-│   └── export.js              # CSS/JSON export helpers
-├── styles/
-│   └── content.css            # Injected overlay styles
-└── icons/                     # 16/32/48/128 toolbar icons
+manifest.json                  # MV3
+background/service-worker.js   # opens side panel, relays sidepanel↔content
+content/
+  selector.js                  # CSS/XPath selector generation + resolution
+  styles-engine.js             # matched rules, computed snapshot, box model
+  overlay.js                   # hover & selected highlight on the page
+  persistence.js               # IndexedDB-backed re-apply & debounced save
+  inspector.js                 # picker, tree serialization, message router
+storage/local-db.js            # IndexedDB wrapper (changes + snapshots)
+sidepanel/
+  index.html                   # tree + tabs layout
+  panel.js                     # UI controller
+  panel.css                    # DevTools-themed styling
+styles/content.css             # injected, overlay-only
 ```
+
+## Persistence model
+
+Edits are stored as records keyed by `(urlPattern, selector, property)`. All applied edits live in a single `<style id="desinspect-overrides">` tag injected at the end of `<html>`, so they win specificity battles via `!important`. HTML edits set `innerHTML` directly and store the prior value for revert.
+
+Re-apply triggers:
+- Initial content-script load (`document_idle`)
+- `pushState` / `replaceState` / `popstate`
+- A `MutationObserver` re-applies (silently) ~500ms after DOM churn settles, so SPA re-renders don't lose your edits.
 
 ## Permissions
 
-- `activeTab`, `scripting` — inject the inspector into the page you're on
-- `storage` — persist the user's API key and preferences
-- `sidePanel` — render the editor UI
-- `webNavigation` — detect SPA route changes as a backup to in-page History API monkey-patches
-- `<all_urls>` — required because the user may want to inspect any site
-- `https://api.anthropic.com/*` — for the optional AI features
+- `activeTab`, `scripting`, `<all_urls>` — inject the inspector everywhere.
+- `storage` — preferences.
+- `sidePanel` — the editor lives there.
+- `webNavigation` — SPA route detection.
 
-## Privacy
-
-DesInspect runs entirely in your browser. No analytics, no telemetry, no remote backend. The only network request the extension ever makes is to `api.anthropic.com`, and only if you explicitly opt in by saving an API key and triggering an audit.
-
-## Roadmap
-
-- [ ] Firefox port
-- [ ] Export changes as a userscript or browser bookmarklet
-- [ ] Share/import snapshot bundles
-- [ ] Visual diff view (screenshot comparison)
-- [ ] Per-element notes/annotations
+No network, no telemetry, no remote backend.
 
 ## License
 
