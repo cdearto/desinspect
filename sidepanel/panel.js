@@ -409,7 +409,17 @@
   function renderStyles() {
     const root = document.getElementById('styles');
     if (!state.selectedInfo) {
-      root.innerHTML = '<div class="empty">Select an element to view its styles.</div>';
+      if (state.selected) {
+        root.innerHTML =
+          `<div class="empty">Couldn't resolve <code>${escapeHtml(state.selected.value)}</code> on the page.<br>` +
+          `It may have been re-rendered or replaced. Try picking again.</div>`;
+      } else {
+        root.innerHTML = '<div class="empty">Select an element to view its styles.</div>';
+      }
+      return;
+    }
+    if (!state.selectedInfo.inline || !state.selectedInfo.matched) {
+      root.innerHTML = '<div class="empty">Styles data missing — try clicking refresh.</div>';
       return;
     }
 
@@ -443,15 +453,19 @@
       targetSelector: state.selected.value,
     });
 
-    // Author rules (matched)
+    // Matched rules — author CSS plus any DesInspect overrides that target
+    // this element. We don't de-dup against `element.style`: edits made under
+    // an author selector (e.g. you added a property to the `*` rule) live in
+    // their own override rule and need to render as such, otherwise they
+    // vanish from the panel even though they're still applied.
     for (const r of info.matched) {
-      // skip our own override sheet — it's already rolled up in inline
-      if (r.origin === 'desinspect') continue;
       rules.push({
-        kind: 'rule',
+        kind: r.origin === 'desinspect' ? 'override' : 'rule',
         selector: r.selector,
-        source: r.source,
-        properties: r.properties,
+        source: r.origin === 'desinspect' ? 'DesInspect edit' : r.source,
+        properties: r.properties.map((p) =>
+          r.origin === 'desinspect' ? { ...p, edited: true } : p
+        ),
         editable: true,
         targetSelector: r.selector,
       });
