@@ -138,22 +138,51 @@ const StylesEngine = (() => {
   const _xoSheetCache = new Map();   // href → CSSStyleSheet (or null on failure)
   const _xoSheetPending = new Map(); // href → Promise
 
+  // Try a same-origin fetch from the content script first (fastest, no SW
+  // round-trip). For cross-origin sheets that the page's CORS policy forbids,
+  // fall back to the service worker, which has extension-level fetch
+  // privileges via the manifest's host_permissions.
+  function fetchViaSW(url) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'FETCH_TEXT', url }, (r) => {
+          if (chrome.runtime.lastError || !r?.ok) {
+            resolve(null);
+            return;
+          }
+          resolve(r.text);
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  async function fetchStylesheetText(href) {
+    try {
+      const res = await fetch(href, { credentials: 'omit' });
+      if (res.ok) return await res.text();
+    } catch {
+      /* CORS or network — fall through to SW */
+    }
+    return fetchViaSW(href);
+  }
+
   async function fetchAsStylesheet(href) {
     if (_xoSheetCache.has(href)) return _xoSheetCache.get(href);
     if (_xoSheetPending.has(href)) return _xoSheetPending.get(href);
     const p = (async () => {
+      const text = await fetchStylesheetText(href);
+      if (!text) {
+        _xoSheetCache.set(href, null);
+        return null;
+      }
       try {
-        const res = await fetch(href, { credentials: 'omit', mode: 'cors' });
-        if (!res.ok) {
-          _xoSheetCache.set(href, null);
-          return null;
-        }
-        const text = await res.text();
         const synth = new CSSStyleSheet();
         synth.replaceSync(text);
         _xoSheetCache.set(href, synth);
         return synth;
-      } catch (err) {
+      } catch {
         _xoSheetCache.set(href, null);
         return null;
       } finally {

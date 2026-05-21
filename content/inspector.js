@@ -242,9 +242,9 @@
       case 'GET_ELEMENT_INFO':
         return await elementInfo(msg.selector);
       case 'APPLY_STYLE':
-        return applyStyleEdit(msg.payload);
+        return await applyStyleEdit(msg.payload);
       case 'APPLY_HTML':
-        return applyHtmlEdit(msg.payload);
+        return await applyHtmlEdit(msg.payload);
       case 'REVERT_CHANGE':
         await Persistence.deleteChange(msg.id);
         return { ok: true };

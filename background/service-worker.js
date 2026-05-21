@@ -18,24 +18,46 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-// Relay messages from sidepanel → content script (the sidepanel doesn't always
-// know which tab is active, so it can send {target: 'content'} via the SW).
+// Service worker handles two kinds of messages:
+// 1) Relays from sidepanel → content script (target: 'content').
+// 2) Fetches initiated by content scripts that need CORS bypass — in MV3,
+//    content scripts are subject to the page's CORS policy, but the service
+//    worker can fetch any URL the extension's host_permissions cover.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.target !== 'content') return false;
-  (async () => {
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) {
-        sendResponse({ ok: false, error: 'no active tab' });
-        return;
+  if (msg?.type === 'FETCH_TEXT' && typeof msg.url === 'string') {
+    (async () => {
+      try {
+        const res = await fetch(msg.url, { credentials: 'omit' });
+        if (!res.ok) {
+          sendResponse({ ok: false, error: `HTTP ${res.status}` });
+          return;
+        }
+        const text = await res.text();
+        sendResponse({ ok: true, text });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
       }
-      const response = await chrome.tabs.sendMessage(tab.id, msg.payload);
-      sendResponse({ ok: true, response });
-    } catch (err) {
-      sendResponse({ ok: false, error: String(err?.message || err) });
-    }
-  })();
-  return true; // async response
+    })();
+    return true;
+  }
+
+  if (msg?.target === 'content') {
+    (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab?.id) {
+          sendResponse({ ok: false, error: 'no active tab' });
+          return;
+        }
+        const response = await chrome.tabs.sendMessage(tab.id, msg.payload);
+        sendResponse({ ok: true, response });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
+  }
+  return false;
 });
 
 // Notify the sidepanel on SPA navigation so it can refresh its view.

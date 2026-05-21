@@ -207,10 +207,10 @@ const Persistence = (() => {
 
   /**
    * Save and apply. CSS edits debounce (high frequency during typing); HTML
-   * and element-removal edits flush immediately so a quick refresh doesn't
-   * lose them.
+   * and element-removal edits flush immediately AND are awaited, so the
+   * panel only sees "saved" once the IDB write committed.
    */
-  function saveChange(input) {
+  async function saveChange(input) {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
     const id = input.id || `${urlPattern}::${input.selector}::${input.property}`;
     const record = {
@@ -229,9 +229,13 @@ const Persistence = (() => {
         clearTimeout(_saveTimers.get(id));
         _saveTimers.delete(id);
       }
-      PersistDB.putChange(record)
-        .then(() => notifyPanel('CHANGE_SAVED', { id }))
-        .catch((err) => console.error('[DesInspect] save failed:', err));
+      try {
+        await PersistDB.putChange(record);
+        notifyPanel('CHANGE_SAVED', { id });
+      } catch (err) {
+        console.error('[DesInspect] save failed:', err);
+        throw err;
+      }
       return record;
     }
 
