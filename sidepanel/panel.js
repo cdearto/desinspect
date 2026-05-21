@@ -101,7 +101,13 @@
     setStatus('No element selected');
   }
 
-  async function refreshTreeRoot() {
+  /**
+   * Re-fetch the DOM tree from the page. Preserves which selector keys
+   * were expanded, but invalidates their cached child lists so they get
+   * re-fetched on render — that's what lets the tree reflect HTML edits
+   * without the user clicking "refresh".
+   */
+  async function refreshTreeRoot({ invalidateCache = true } = {}) {
     // The content script may not be live yet when the side panel first opens
     // (especially on slow/initial loads). Retry with short backoff so we
     // don't strand the user on an empty tree.
@@ -110,6 +116,13 @@
       r = await send('GET_TREE_CHILDREN', { selector: null });
       if (r?.nodes?.length) break;
       await new Promise((res) => setTimeout(res, 200));
+    }
+    if (invalidateCache) {
+      for (const key of Array.from(state.tree.expanded.keys())) {
+        if (Array.isArray(state.tree.expanded.get(key))) {
+          state.tree.expanded.set(key, true);
+        }
+      }
     }
     state.tree.rootChildren = r?.nodes || [];
     renderTree();
@@ -1154,6 +1167,7 @@
       x.addEventListener('click', async () => {
         await send('REVERT_CHANGE', { id: c.id });
         await loadChanges();
+        await refreshTreeRoot();
         if (state.selected) await loadElementInfo();
       });
       actions.appendChild(x);
@@ -1206,6 +1220,7 @@
         if (!confirm(`Restore "${s.name}"? This will replace current edits.`)) return;
         await send('RESTORE_SNAPSHOT', { id: s.id });
         await loadChanges();
+        await refreshTreeRoot();
         if (state.selected) await loadElementInfo();
       });
       const del = document.createElement('button');
@@ -1239,6 +1254,7 @@
     if (!confirm('Revert ALL edits on this page?')) return;
     await send('REVERT_ALL');
     await loadChanges();
+    await refreshTreeRoot();
     if (state.selected) await loadElementInfo();
   });
 
