@@ -152,14 +152,14 @@
 
   // ─── Element info for sidepanel ────────────────────────────────────────────
 
-  function elementInfo(selectorObj) {
+  async function elementInfo(selectorObj) {
     const el = selectorObj ? SelectorEngine.find(selectorObj) : _selected;
     if (!el) return null;
     return {
       selector: SelectorEngine.generate(el),
       describe: describeElement(el),
       inline: StylesEngine.inlineRule(el),
-      matched: StylesEngine.matchedRules(el),
+      matched: await StylesEngine.matchedRules(el),
       computed: StylesEngine.computedSnapshot(el),
       box: StylesEngine.boxModel(el),
       outerHTML: el.outerHTML.length < 50000 ? el.outerHTML : null,
@@ -240,7 +240,7 @@
         return { ok: !!el };
       }
       case 'GET_ELEMENT_INFO':
-        return elementInfo(msg.selector);
+        return await elementInfo(msg.selector);
       case 'APPLY_STYLE':
         return applyStyleEdit(msg.payload);
       case 'APPLY_HTML':

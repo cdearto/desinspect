@@ -132,13 +132,65 @@ const StylesEngine = (() => {
     });
   }
 
-  function matchedRules(el) {
+  // Cross-origin stylesheets throw on .cssRules access. Fetch the text
+  // (the extension's host_permissions bypass CORS for content-script fetches)
+  // and replay it into a constructible CSSStyleSheet so we can walk its rules.
+  const _xoSheetCache = new Map();   // href → CSSStyleSheet (or null on failure)
+  const _xoSheetPending = new Map(); // href → Promise
+
+  async function fetchAsStylesheet(href) {
+    if (_xoSheetCache.has(href)) return _xoSheetCache.get(href);
+    if (_xoSheetPending.has(href)) return _xoSheetPending.get(href);
+    const p = (async () => {
+      try {
+        const res = await fetch(href, { credentials: 'omit', mode: 'cors' });
+        if (!res.ok) {
+          _xoSheetCache.set(href, null);
+          return null;
+        }
+        const text = await res.text();
+        const synth = new CSSStyleSheet();
+        synth.replaceSync(text);
+        _xoSheetCache.set(href, synth);
+        return synth;
+      } catch (err) {
+        _xoSheetCache.set(href, null);
+        return null;
+      } finally {
+        _xoSheetPending.delete(href);
+      }
+    })();
+    _xoSheetPending.set(href, p);
+    return p;
+  }
+
+  async function matchedRules(el) {
     const out = [];
-    for (const sheet of Array.from(document.styleSheets)) {
+    const sheets = Array.from(document.styleSheets);
+
+    // First pass: same-origin sheets (sync).
+    const xoTargets = [];
+    for (const sheet of sheets) {
       const rules = safeRules(sheet);
-      if (!rules) continue;
       const src = sheetSource(sheet);
-      walkRules(out, rules, el, sheet, src, '');
+      if (rules) {
+        walkRules(out, rules, el, sheet, src, '');
+      } else if (sheet.href) {
+        xoTargets.push({ sheet, src });
+      }
+    }
+
+    // Second pass: cross-origin sheets, fetched in parallel.
+    if (xoTargets.length) {
+      const fetched = await Promise.all(
+        xoTargets.map(({ sheet }) => fetchAsStylesheet(sheet.href))
+      );
+      for (let i = 0; i < xoTargets.length; i++) {
+        const synth = fetched[i];
+        if (!synth) continue;
+        const { sheet, src } = xoTargets[i];
+        walkRules(out, synth.cssRules, el, sheet, src + ' (xo)', '');
+      }
     }
     return out;
   }

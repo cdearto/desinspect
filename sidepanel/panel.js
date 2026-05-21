@@ -53,7 +53,14 @@
         if (msg.data.selector) {
           state.selected = msg.data.selector;
           loadElementInfo();
-          revealInTree(state.selected);
+          // If the initial tree fetch raced the content script and came back
+          // empty, the user clearly has a working content script now (they
+          // just picked something), so try the root again.
+          if (!state.tree.rootChildren.length) {
+            refreshTreeRoot().then(() => revealInTree(state.selected));
+          } else {
+            revealInTree(state.selected);
+          }
         }
         break;
       case 'CHANGES_LOADED':
@@ -95,7 +102,15 @@
   }
 
   async function refreshTreeRoot() {
-    const r = await send('GET_TREE_CHILDREN', { selector: null });
+    // The content script may not be live yet when the side panel first opens
+    // (especially on slow/initial loads). Retry with short backoff so we
+    // don't strand the user on an empty tree.
+    let r = null;
+    for (let i = 0; i < 5; i++) {
+      r = await send('GET_TREE_CHILDREN', { selector: null });
+      if (r?.nodes?.length) break;
+      await new Promise((res) => setTimeout(res, 200));
+    }
     state.tree.rootChildren = r?.nodes || [];
     renderTree();
   }
@@ -118,7 +133,8 @@
   function renderTree() {
     const root = document.getElementById('tree');
     if (!state.tree.rootChildren.length) {
-      root.innerHTML = '<div class="tree-empty">No elements loaded.</div>';
+      root.innerHTML =
+        '<div class="tree-empty">No elements yet — try clicking <strong>Pick</strong>, or reload the page if it just loaded.</div>';
       return;
     }
     root.innerHTML = '';
