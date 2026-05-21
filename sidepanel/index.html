@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DesInspect</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="pi-header">
+    <div class="pi-header__brand">
+      <svg class="pi-header__logo" width="20" height="20" viewBox="0 0 20 20" fill="none">
+        <rect width="20" height="20" rx="4" fill="#4F8EF7"/>
+        <circle cx="10" cy="10" r="4" stroke="white" stroke-width="1.5" fill="none" opacity="0.9"/>
+        <path d="M10 4v3M10 13v3M4 10h3M13 10h3" stroke="white" stroke-width="1.5" stroke-linecap="round" opacity="0.9"/>
+      </svg>
+      <span class="pi-header__title">DesInspect</span>
+    </div>
+    <div class="pi-header__actions">
+      <button id="btn-inspector" class="pi-btn pi-btn--inspect" title="Toggle Inspector">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="3.5" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M8 2v3M8 11v3M2 8h3M11 8h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        Inspect
+      </button>
+      <button id="btn-snapshot" class="pi-btn pi-btn--ghost" title="Save Snapshot" disabled>
+        💾 Snapshot
+      </button>
+      <button id="btn-help" class="pi-btn pi-btn--icon" title="Help & Guide" aria-label="Help">?</button>
+    </div>
+  </header>
+
+  <!-- Help Panel (slide-down overlay) -->
+  <div id="help-panel" class="pi-help" hidden>
+    <div class="pi-help__header">
+      <h2>DesInspect Guide</h2>
+      <button id="btn-help-close" class="pi-btn pi-btn--icon" title="Close">✕</button>
+    </div>
+    <div class="pi-help__body">
+
+      <div class="pi-help__section">
+        <h3>🔍 Inspect</h3>
+        <p>Click <strong>Inspect</strong> to activate element selection mode. Hover over any element on the page to highlight it, then click to select it for editing. The element's CSS and HTML become editable in the side panel.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>💾 Snapshot</h3>
+        <p>Save a named checkpoint of all your current changes. Useful for marking a state before experimenting further — like a git commit for your browser edits.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>📦 Box Model</h3>
+        <p>Shows the selected element's margin, border, padding, and content dimensions — exactly like Chrome DevTools' box model diagram. Values update when you select a new element.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>🧭 DOM Navigator</h3>
+        <p>A vertical tree showing the selected element in context. Click any ancestor (parent), sibling, or child to re-select it. Use the <strong>↑ ↓ ← →</strong> arrow buttons for quick keyboard-style navigation. Hover any node to highlight it on the page.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>🎨 CSS / HTML Modes</h3>
+        <p><strong>CSS mode:</strong> Edit inline styles and quick-edit common properties (color, font, spacing, etc.) with live preview.<br>
+        <strong>HTML mode:</strong> Edit the element's inner HTML directly. Supports tab indentation and Cmd/Ctrl+Enter to apply.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>⟷ Diff</h3>
+        <p>Toggle between <strong>original</strong> and <strong>modified</strong> states on the live page. All your changes flip back to the original simultaneously — great for before/after comparison. Click again to restore your edits.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>📋 Changes Tab</h3>
+        <p>Lists every CSS and HTML modification you've made on this page, with inline diffs showing old → new values. Each change has:</p>
+        <ul>
+          <li><strong>Select</strong> — Jump to that element</li>
+          <li><strong>👁 Preview</strong> — Toggle just that one change between original/modified</li>
+          <li><strong>Revert</strong> — Permanently undo that change</li>
+        </ul>
+        <p>Use <strong>Copy CSS Diff</strong> to export all changes as clean CSS, or <strong>Export JSON</strong> for the full changeset.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>⏱ History Tab</h3>
+        <p>A chronological log of every edit action. Useful for reviewing what you changed and when.</p>
+      </div>
+
+      <div class="pi-help__section">
+        <h3>🤖 AI UX Audit Tab</h3>
+        <p>Powered by Claude, this runs AI-driven accessibility and usability checks on your selected element. Requires an Anthropic API key (stored locally only).</p>
+        <ul>
+          <li><strong>Audit Selected Element</strong> — Checks WCAG contrast, font sizes, touch targets, semantic HTML, visual hierarchy, and more. Returns actionable findings with one-click CSS fixes.</li>
+          <li><strong>Check Change Impact</strong> — Reviews the changes you've made and flags whether they help or hurt accessibility and usability.</li>
+        </ul>
+        <p>Your API key is never sent anywhere except the Anthropic API. Each audit costs less than $0.01.</p>
+      </div>
+
+      <div class="pi-help__section pi-help__section--tip">
+        <h3>💡 Tips</h3>
+        <ul>
+          <li>All changes <strong>auto-save</strong> to IndexedDB — they survive page refreshes and browser restarts</li>
+          <li>Changes are <strong>scoped to the URL</strong> — edits on one page won't affect another</li>
+          <li><strong>Ctrl+Z / Cmd+Z</strong> to undo, <strong>Ctrl+Shift+Z / Cmd+Shift+Z</strong> to redo (up to 100 levels)</li>
+          <li>Use <strong>Tab / Shift+Tab</strong> in the HTML editor to indent/outdent code</li>
+          <li>Hover elements in the DOM Navigator to see them highlighted on the page before selecting</li>
+        </ul>
+      </div>
+
+    </div>
+  </div>
+
+
+  <!-- Status Bar -->
+  <div id="status-bar" class="pi-status">
+    <span id="status-text">Click the crosshair to start selecting elements.</span>
+  </div>
+
+  <!-- Tabs -->
+  <nav class="pi-tabs" role="tablist">
+    <button class="pi-tab pi-tab--active" role="tab" data-tab="editor" aria-selected="true">Editor</button>
+    <button class="pi-tab" role="tab" data-tab="changes" aria-selected="false">
+      Changes <span id="changes-count" class="pi-badge" hidden>0</span>
+    </button>
+    <button class="pi-tab" role="tab" data-tab="audit" aria-selected="false">AI UX Audit</button>
+    <button class="pi-tab" role="tab" data-tab="history" aria-selected="false">History</button>
+  </nav>
+
+  <!-- Tab Panels -->
+  <div class="pi-panels">
+
+    <!-- Editor Panel -->
+    <section id="panel-editor" class="pi-panel pi-panel--active" role="tabpanel">
+
+      <!-- Compact empty prompt (shown before any selection) -->
+      <div id="editor-empty" class="pi-empty-compact">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="opacity:0.35">
+          <circle cx="8" cy="8" r="3.5" stroke="#94A3B8" stroke-width="1.5"/>
+          <path d="M8 2v3M8 11v3M2 8h3M11 8h3" stroke="#94A3B8" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <span>Select an element on the page to start editing</span>
+      </div>
+
+      <div id="editor-content" class="pi-editor" hidden>
+
+        <!-- Copilot: natural language CSS/HTML editing -->
+        <div class="pi-copilot" id="copilot">
+          <div class="pi-copilot__header">
+            <svg class="pi-copilot__icon" width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M8 1.5l1.5 3.5H14l-3.5 2.5 1.5 4L8 9l-4 2.5 1.5-4L2 5h4.5L8 1.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>
+            </svg>
+            <h3>AI Helper</h3>
+            <span class="pi-copilot__tip" tabindex="0" aria-label="AI Helper tips">
+              ?
+              <span class="pi-copilot__tip-content">
+                Describe what you want to change in plain English:
+                <br><br>
+                <strong>Style changes</strong> — "make this bigger", "add more padding", "change the color to blue"
+                <br>
+                <strong>Layout</strong> — "center this", "make it full width", "add a border"
+                <br>
+                <strong>Typography</strong> — "use a bolder font", "increase line spacing", "make the text smaller"
+                <br>
+                <strong>Effects</strong> — "round the corners", "add a shadow", "make it semi-transparent"
+                <br>
+                <strong>Visibility</strong> — "hide this element", "make it invisible"
+                <br><br>
+                Requires an API key set up in the AI UX Audit tab, or enable Test Mode for mock responses.
+              </span>
+            </span>
+          </div>
+          <div class="pi-copilot__input-row">
+            <input
+              type="text"
+              id="copilot-input"
+              class="pi-copilot__input"
+              placeholder="e.g. make this bigger with more padding"
+              disabled
+            >
+            <button id="btn-copilot-send" class="pi-btn pi-btn--primary pi-btn--small" disabled>Go</button>
+          </div>
+          <div id="copilot-loading" class="pi-copilot__loading" hidden>
+            <span class="pi-copilot__spinner"></span> Thinking…
+          </div>
+          <div id="copilot-error" class="pi-copilot__error" hidden></div>
+          <div id="copilot-results" class="pi-copilot__results" hidden>
+            <!-- Dynamically populated: summary + change list + apply/dismiss -->
+          </div>
+        </div>
+
+        <!-- DOM Navigator + Box Model: side by side -->
+        <div class="pi-inspect-row">
+
+          <!-- DOM Navigator -->
+          <div class="pi-domnav" id="dom-navigator">
+            <div class="pi-domnav__header">
+              <h3>DOM Navigator</h3>
+              <div class="pi-domnav__controls">
+                <button id="btn-nav-parent" class="pi-btn pi-btn--small pi-btn--icon" title="Select parent (↑)">↑</button>
+                <button id="btn-nav-prev" class="pi-btn pi-btn--small pi-btn--icon" title="Previous sibling">←</button>
+                <button id="btn-nav-next" class="pi-btn pi-btn--small pi-btn--icon" title="Next sibling">→</button>
+                <button id="btn-nav-child" class="pi-btn pi-btn--small pi-btn--icon" title="Select first child (↓)">↓</button>
+              </div>
+            </div>
+            <div class="pi-domnav__tree" id="dom-tree">
+              <!-- Dynamically populated vertical tree -->
+            </div>
+          </div>
+
+          <!-- Drag handle to resize DOM Nav / Box Model widths -->
+          <div class="pi-inspect-row__handle" id="inspect-row-handle" title="Drag to resize"></div>
+
+          <!-- Box Model Diagram (Chrome DevTools style) -->
+          <div class="pi-boxmodel" id="boxmodel">
+            <div class="pi-boxmodel__margin">
+              <span class="pi-boxmodel__label">margin</span>
+              <div class="pi-boxmodel__row pi-boxmodel__row--top">
+                <span class="pi-boxmodel__val" id="bm-margin-top">–</span>
+              </div>
+              <div class="pi-boxmodel__mid">
+                <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-margin-left">–</span></div>
+                <div class="pi-boxmodel__border">
+                  <span class="pi-boxmodel__label">border</span>
+                  <div class="pi-boxmodel__row pi-boxmodel__row--top">
+                    <span class="pi-boxmodel__val" id="bm-border-top">–</span>
+                  </div>
+                  <div class="pi-boxmodel__mid">
+                    <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-border-left">–</span></div>
+                    <div class="pi-boxmodel__padding">
+                      <span class="pi-boxmodel__label">padding</span>
+                      <div class="pi-boxmodel__row pi-boxmodel__row--top">
+                        <span class="pi-boxmodel__val" id="bm-padding-top">–</span>
+                      </div>
+                      <div class="pi-boxmodel__mid">
+                        <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-padding-left">–</span></div>
+                        <div class="pi-boxmodel__content" id="bm-content">
+                          <span id="bm-content-size">– × –</span>
+                        </div>
+                        <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-padding-right">–</span></div>
+                      </div>
+                      <div class="pi-boxmodel__row pi-boxmodel__row--bottom">
+                        <span class="pi-boxmodel__val" id="bm-padding-bottom">–</span>
+                      </div>
+                    </div>
+                    <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-border-right">–</span></div>
+                  </div>
+                  <div class="pi-boxmodel__row pi-boxmodel__row--bottom">
+                    <span class="pi-boxmodel__val" id="bm-border-bottom">–</span>
+                  </div>
+                </div>
+                <div class="pi-boxmodel__col"><span class="pi-boxmodel__val" id="bm-margin-right">–</span></div>
+              </div>
+              <div class="pi-boxmodel__row pi-boxmodel__row--bottom">
+                <span class="pi-boxmodel__val" id="bm-margin-bottom">–</span>
+              </div>
+            </div>
+            <div class="pi-boxmodel__position" id="bm-position">
+              <span id="bm-position-text"></span>
+            </div>
+          </div>
+
+        </div><!-- /.pi-inspect-row -->
+
+        <!-- Element Header: compact selector + tag pill + undo/redo -->
+        <div class="pi-element-header" id="element-header">
+          <div class="pi-element-header__left">
+            <div class="pi-element-header__tag" id="element-tag-pill"></div>
+            <code id="element-selector" class="pi-element-header__selector"></code>
+            <span id="selector-warning" class="pi-selector-warning-icon" hidden tabindex="0">
+              ⚠
+              <span class="pi-selector-warning-icon__tip" id="selector-warning-text"></span>
+            </span>
+          </div>
+          <div class="pi-element-header__actions">
+            <button id="btn-undo" class="pi-btn pi-btn--icon" title="Undo (Ctrl+Z)" disabled>↩</button>
+            <button id="btn-redo" class="pi-btn pi-btn--icon" title="Redo (Ctrl+Shift+Z)" disabled>↪</button>
+          </div>
+        </div>
+
+        <!-- Mode Toggle: CSS / HTML + Diff toggle -->
+        <div class="pi-mode-toggle">
+          <div class="pi-mode-toggle__modes">
+            <button class="pi-mode-toggle__btn pi-mode-toggle__btn--active" data-mode="css">CSS</button>
+            <button class="pi-mode-toggle__btn" data-mode="html">HTML</button>
+          </div>
+          <button id="btn-editor-diff" class="pi-btn pi-btn--small pi-btn--diff" title="Toggle between original and modified states on the page">
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none" style="vertical-align:-1px">
+              <rect x="1" y="1" width="5" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+              <rect x="8" y="1" width="5" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+            </svg>
+            Diff
+          </button>
+        </div>
+
+        <!-- CSS Mode -->
+        <div id="mode-css" class="pi-editor__mode">
+          <!-- Toolbar -->
+          <div class="dt-toolbar">
+            <input type="text" id="dt-filter" class="dt-filter" placeholder="Filter styles…">
+            <button id="dt-cls-toggle" class="dt-tool-btn" title="Toggle element classes">.cls</button>
+            <button id="dt-add-rule" class="dt-tool-btn" title="Add new style rule">+</button>
+          </div>
+          <!-- Class toggle panel -->
+          <div id="dt-cls-panel" class="dt-cls-panel" hidden>
+            <input type="text" id="dt-cls-input" class="dt-cls-input" placeholder="Add new class…">
+            <div id="dt-cls-list" class="dt-cls-list"></div>
+          </div>
+          <!-- Styles content -->
+          <div id="dt-styles" class="dt-styles">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+
+        <!-- HTML Mode -->
+        <div id="mode-html" class="pi-editor__mode" hidden>
+          <div class="pi-editor__section">
+            <div class="pi-editor__section-header">
+              <h3>Inner HTML</h3>
+              <div class="pi-html-actions">
+                <button id="btn-html-apply" class="pi-btn pi-btn--primary pi-btn--small">Apply</button>
+                <button id="btn-html-reset" class="pi-btn pi-btn--small" title="Reset to original">Reset</button>
+              </div>
+            </div>
+            <div class="pi-html-editor">
+              <div class="pi-html-editor__gutter" id="html-gutter" aria-hidden="true">
+                <!-- Line numbers injected by JS -->
+              </div>
+              <textarea
+                id="html-textarea"
+                class="pi-html-editor__textarea"
+                spellcheck="false"
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                placeholder="Select an element to view its HTML"
+              ></textarea>
+            </div>
+            <div class="pi-html-info">
+              <span id="html-char-count" class="pi-html-info__count">0 chars</span>
+              <span id="html-status" class="pi-html-info__status"></span>
+            </div>
+          </div>
+
+          <!-- Outer HTML (interactive — hover to highlight, click to select) -->
+          <div class="pi-editor__section">
+            <div class="pi-editor__section-header">
+              <h3>Outer HTML</h3>
+              <button id="btn-outer-copy" class="pi-btn pi-btn--small" title="Copy outer HTML">📋 Copy</button>
+            </div>
+            <div id="outer-html-tree" class="pi-outer-tree"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Changes Panel -->
+    <section id="panel-changes" class="pi-panel" role="tabpanel" hidden>
+      <div id="changes-empty" class="pi-empty">
+        <p class="pi-empty__text">No changes recorded yet</p>
+      </div>
+      <div id="changes-actions" class="pi-changes__actions" hidden>
+        <button id="btn-diff-toggle" class="pi-btn pi-btn--ghost" title="Toggle between original and modified states on the page">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style="vertical-align:-2px; margin-right:3px">
+            <rect x="1" y="1" width="5" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+            <rect x="8" y="1" width="5" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+          </svg>
+          Show Original
+        </button>
+        <button id="btn-export-css" class="pi-btn pi-btn--primary">📋 Copy CSS Diff</button>
+        <button id="btn-export-json" class="pi-btn pi-btn--ghost">Export JSON</button>
+        <button id="btn-revert-all" class="pi-btn pi-btn--danger">⟲ Revert All</button>
+      </div>
+      <div id="changes-list" class="pi-changes" hidden>
+        <!-- Dynamically populated -->
+      </div>
+    </section>
+
+    <!-- AI UX Audit Panel -->
+    <section id="panel-audit" class="pi-panel" role="tabpanel" hidden>
+
+      <!-- API Key Setup (shown when no key) -->
+      <div id="audit-setup" class="pi-audit-setup">
+        <div class="pi-audit-setup__icon">🤖</div>
+        <h3 class="pi-audit-setup__title">AI UX Audit</h3>
+        <p id="audit-setup-desc" class="pi-audit-setup__desc">Get AI-powered accessibility and usability audits on any element or full page. Enter your Anthropic API key to start — each audit costs less than $0.01.</p>
+        <div class="pi-audit-setup__input-row">
+          <input id="audit-api-key" type="password" class="pi-input pi-audit-setup__input" placeholder="sk-ant-api03-..." autocomplete="off">
+          <button id="btn-save-key" class="pi-btn pi-btn--primary pi-btn--small">Save</button>
+        </div>
+        <p class="pi-audit-setup__hint">Get your key at <a href="https://console.anthropic.com/settings/keys" target="_blank">console.anthropic.com</a></p>
+        <div class="pi-audit-setup__test">
+          <button id="btn-test-mode" class="pi-btn pi-btn--small pi-btn--ghost">🧪 Use Test Mode (mock data)</button>
+        </div>
+      </div>
+
+      <!-- Audit Controls (shown when key is set) -->
+      <div id="audit-controls" class="pi-audit-controls" hidden>
+        <div class="pi-audit-controls__actions">
+          <button id="btn-audit-page" class="pi-btn pi-btn--primary">
+            📄 Audit Page
+          </button>
+          <button id="btn-audit-element" class="pi-btn pi-btn--ghost" disabled>
+            🔍 Audit Selected Element
+          </button>
+          <button id="btn-check-impact" class="pi-btn pi-btn--ghost" disabled>
+            ⚡ Check Change Impact
+          </button>
+        </div>
+        <div class="pi-audit-controls__key-row">
+          <span class="pi-audit-controls__key-status">✓ API key connected</span>
+          <button id="btn-remove-key" class="pi-btn pi-btn--small pi-btn--ghost">Remove Key</button>
+        </div>
+      </div>
+
+      <!-- Audit Loading -->
+      <div id="audit-loading" class="pi-audit-loading" hidden>
+        <div class="pi-audit-loading__spinner"></div>
+        <span>Analyzing element with Claude…</span>
+      </div>
+
+      <!-- Audit Results -->
+      <div id="audit-results" class="pi-audit-results" hidden>
+        <!-- Summary header -->
+        <div id="audit-summary" class="pi-audit-summary"></div>
+        <!-- Findings list -->
+        <div id="audit-findings" class="pi-audit-findings"></div>
+      </div>
+
+      <!-- Audit Empty State -->
+      <div id="audit-empty" class="pi-empty" hidden>
+        <p class="pi-empty__text">Select an element and click "Audit" to run an AI-powered UX review</p>
+      </div>
+
+    </section>
+
+    <!-- History Panel -->
+    <section id="panel-history" class="pi-panel" role="tabpanel" hidden>
+      <div id="history-empty" class="pi-empty">
+        <p class="pi-empty__text">Edit history will appear here</p>
+      </div>
+      <div id="history-list" class="pi-history" hidden>
+        <!-- Dynamically populated -->
+      </div>
+    </section>
+
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="pi-toast" hidden></div>
+
+  <script src="../ai/prompt-templates.js"></script>
+  <script src="../ai/audit-engine.js"></script>
+  <script src="panel.js"></script>
+</body>
+</html>

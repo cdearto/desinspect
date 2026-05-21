@@ -1,0 +1,60 @@
+/*
+ * DesInspect — Content Script Styles
+ * 
+ * Minimal styles injected into the page for overlay indicators.
+ * Uses data attributes to avoid class name conflicts.
+ * All colors use the DesInspect blue (#4F8EF7) for brand consistency.
+ */
+
+/* Modified element indicator — subtle top-right dot */
+[data-desinspect-modified] {
+  outline: 1px dashed rgba(79, 142, 247, 0.4) !important;
+  outline-offset: 1px !important;
+}
+
+[data-desinspect-modified]::after {
+  content: '' !important;
+  position: absolute !important;
+  top: -3px !important;
+  right: -3px !important;
+  width: 6px !important;
+  height: 6px !important;
+  background: #4F8EF7 !important;
+  border-radius: 50% !important;
+  z-index: 2147483645 !important;
+  pointer-events: none !important;
+}
+
+/* Selected element outline */
+[data-desinspect-selected] {
+  outline: 2px solid #4F8EF7 !important;
+  outline-offset: 1px !important;
+}
+
+/* ─── Flash Highlight Animations ─────────────────────────────────────────── */
+
+/* Full flash: 2-pulse attention-grab when navigating to an element
+   from the Changes panel "Select" button */
+@keyframes desinspect-flash {
+  0%   { background: rgba(79, 142, 247, 0.30) !important; border-color: #4F8EF7 !important; }
+  25%  { background: rgba(79, 142, 247, 0.05) !important; border-color: rgba(79, 142, 247, 0.4) !important; }
+  50%  { background: rgba(79, 142, 247, 0.30) !important; border-color: #4F8EF7 !important; }
+  75%  { background: rgba(79, 142, 247, 0.05) !important; border-color: rgba(79, 142, 247, 0.4) !important; }
+  100% { background: rgba(79, 142, 247, 0.06) !important; border-color: #4F8EF7 !important; }
+}
+
+#desinspect-highlight.desinspect-flash {
+  animation: desinspect-flash 0.8s ease-out !important;
+}
+
+/* Subtle flash: single gentle pulse when returning to the tab
+   to re-orient the user to their selected element */
+@keyframes desinspect-flash-subtle {
+  0%   { background: rgba(79, 142, 247, 0.20) !important; }
+  50%  { background: rgba(79, 142, 247, 0.04) !important; }
+  100% { background: rgba(79, 142, 247, 0.06) !important; }
+}
+
+#desinspect-highlight.desinspect-flash-subtle {
+  animation: desinspect-flash-subtle 0.5s ease-out !important;
+}
