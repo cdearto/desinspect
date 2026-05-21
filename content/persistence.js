@@ -45,9 +45,14 @@ const Persistence = (() => {
   function applyRuleToSheet(record) {
     const sheet = getStylesheet();
     const ruleSelector = record.selector;
-    const cssText = `${ruleSelector} { ${record.property}: ${record.value} !important; }`;
+    // For disabled records, override with `revert` so the property actually
+    // turns off (otherwise the author rule keeps applying and the user's
+    // checkbox does nothing visible).
+    const value = record.disabled ? 'revert' : record.value;
+    const cssText = `${ruleSelector} { ${record.property}: ${value} !important; }`;
 
-    // Find existing rule for this (selector, property)
+    // Remove any existing rule for this (selector, property) pair before
+    // inserting the new one, so we don't accumulate stale rules.
     for (let i = sheet.cssRules.length - 1; i >= 0; i--) {
       const r = sheet.cssRules[i];
       if (
@@ -59,7 +64,6 @@ const Persistence = (() => {
       }
     }
 
-    if (record.disabled) return;
     try {
       sheet.insertRule(cssText, sheet.cssRules.length);
     } catch (err) {

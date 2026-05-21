@@ -578,57 +578,114 @@
     const filter = (document.getElementById('style-filter').value || '').toLowerCase();
     const info = state.selectedInfo;
 
-    // 1. element.style (inline) + DesInspect edits for this selector
-    const myEdits = state.changes.filter(
-      (c) => c.selector === state.selected.value && c.property !== '__html__' && c.property !== '__remove__'
-    );
+    // Index every CSS change by (selector, property). When we render the
+    // owning rule we fold the change into its properties in-place, so
+    // toggling a checkbox doesn't spawn a duplicate row in the panel.
+    const changesByKey = new Map();
+    for (const c of state.changes) {
+      if (c.property === '__html__' || c.property === '__remove__') continue;
+      changesByKey.set(`${c.selector}::${c.property}`, c);
+    }
+    const consumedKeys = new Set();
+
+    function mergeChangesIntoProps(originalProps, selector) {
+      const merged = originalProps.map((p) => ({ ...p }));
+      for (const [key, e] of changesByKey.entries()) {
+        if (e.selector !== selector) continue;
+        const idx = merged.findIndex((p) => p.name === e.property);
+        if (idx >= 0) {
+          merged[idx] = {
+            ...merged[idx],
+            value: e.value,
+            important: true,
+            edited: true,
+            disabled: !!e.disabled,
+            id: e.id,
+          };
+        } else {
+          merged.push({
+            name: e.property,
+            value: e.value,
+            important: true,
+            edited: true,
+            disabled: !!e.disabled,
+            id: e.id,
+            _added: true,
+          });
+        }
+        consumedKeys.add(key);
+      }
+      return merged;
+    }
 
     const rules = [];
 
-    // Inline rule (combines page's inline style + my edits)
-    const inlineProps = [...info.inline.properties];
-    for (const e of myEdits) {
-      // overlay/override inline
-      const i = inlineProps.findIndex((p) => p.name === e.property);
-      if (i >= 0) {
-        inlineProps[i] = { name: e.property, value: e.value, important: true, edited: true, id: e.id, disabled: e.disabled };
-      } else {
-        inlineProps.push({ name: e.property, value: e.value, important: true, edited: true, id: e.id, disabled: e.disabled });
-      }
-    }
+    // 1) element.style — inline page styles plus any edits on the selected
+    // element's own selector.
+    const inlineSelector = state.selected.value;
     rules.push({
       kind: 'inline',
       selector: 'element.style',
       source: '',
-      properties: inlineProps,
+      properties: mergeChangesIntoProps(info.inline.properties, inlineSelector),
       editable: true,
-      targetSelector: state.selected.value,
+      targetSelector: inlineSelector,
     });
 
-    // Matched rules — author CSS plus any DesInspect overrides that target
-    // this element. We don't de-dup against `element.style`: edits made under
-    // an author selector (e.g. you added a property to the `*` rule) live in
-    // their own override rule and need to render as such, otherwise they
-    // vanish from the panel even though they're still applied.
+    // 2) Author rules. Skip the rules we manufactured in our own override
+    // stylesheet — they're already accounted for by merging into the rule
+    // they target.
     for (const r of info.matched) {
+      if (r.origin === 'desinspect') continue;
       rules.push({
-        kind: r.origin === 'desinspect' ? 'override' : 'rule',
+        kind: 'rule',
         selector: r.selector,
         pseudo: r.pseudo || null,
-        source: r.origin === 'desinspect' ? 'DesInspect edit' : r.source,
-        properties: r.properties.map((p) =>
-          r.origin === 'desinspect' ? { ...p, edited: true } : p
-        ),
+        source: r.source,
+        properties: mergeChangesIntoProps(r.properties, r.selector),
         editable: true,
         targetSelector: r.selector,
       });
     }
 
-    // Compute "overridden" by walking from top: first occurrence of a prop wins
+    // 3) Orphan edits — changes whose selector doesn't match any rendered
+    // rule above (rare; happens when the author rule was removed or the
+    // user used "+ new rule" to add a property under a selector that
+    // doesn't otherwise match this element). Group by selector.
+    const orphans = new Map();
+    for (const [key, e] of changesByKey.entries()) {
+      if (consumedKeys.has(key)) continue;
+      if (!orphans.has(e.selector)) orphans.set(e.selector, []);
+      orphans.get(e.selector).push({
+        name: e.property,
+        value: e.value,
+        important: true,
+        edited: true,
+        disabled: !!e.disabled,
+        id: e.id,
+        _added: true,
+      });
+    }
+    for (const [sel, props] of orphans.entries()) {
+      rules.push({
+        kind: 'rule',
+        selector: sel,
+        pseudo: null,
+        source: 'DesInspect edit',
+        properties: props,
+        editable: true,
+        targetSelector: sel,
+      });
+    }
+
+    // Compute "overridden": walking from top, first occurrence of a name
+    // wins, later ones are struck through. Disabled properties don't win
+    // anything — they shouldn't mark lower-cascade siblings as overridden.
     const seen = new Set();
     for (const r of rules) {
       for (const p of r.properties) {
-        if (!filter || p.name.includes(filter) || p.value.toLowerCase().includes(filter)) {
+        if (!filter || p.name.includes(filter) || (p.value || '').toLowerCase().includes(filter)) {
+          if (p.disabled) continue;
           if (seen.has(p.name)) p._overridden = true;
           else seen.add(p.name);
         }
@@ -915,36 +972,48 @@
     await loadChanges();
   }
 
+  /**
+   * Checkbox toggle on a property row. Three flavors:
+   *   - Unchecking anything → persist a `disabled` change. The override
+   *     stylesheet inserts `revert !important` so the property turns off.
+   *   - Re-checking a property that was originally in the author CSS
+   *     (`p.edited && !p._added`) → delete the change entirely so the
+   *     original cascade resumes.
+   *   - Re-checking a property we added ourselves → keep the change but
+   *     clear its disabled flag.
+   */
   async function toggleProp(rule, p, disabled) {
-    if (rule.kind === 'inline' && p.edited) {
-      // It's a persisted edit — toggle its disabled flag
-      const sel = state.selected;
+    if (!state.selected) return;
+    const sel = rule.kind === 'inline'
+      ? state.selected
+      : { type: 'css', value: rule.targetSelector };
+
+    if (!disabled) {
+      // Re-check.
+      if (p.edited && !p._added && p.id) {
+        await send('REVERT_CHANGE', { id: p.id });
+      } else {
+        await send('APPLY_STYLE', {
+          payload: {
+            selector: sel,
+            property: p.name,
+            value: p.value,
+            disabled: false,
+            elementLabel: state.selected.value,
+          },
+        });
+      }
+    } else {
+      // Uncheck → persist disabled.
       await send('APPLY_STYLE', {
         payload: {
           selector: sel,
           property: p.name,
           value: p.value,
-          disabled,
+          disabled: true,
           elementLabel: state.selected.value,
         },
       });
-    } else {
-      // Author rule property: persist a disabled marker so we override-remove it,
-      // or persist the value so toggling back restores it.
-      const sel = { type: 'css', value: rule.targetSelector };
-      if (disabled) {
-        // To "disable" an author rule's property we override it to its initial value.
-        // Simpler: persist value with disabled=true; on re-apply this removes our rule
-        // and the author rule still applies. To truly disable, we'd need a userAgent
-        // hack. For now we just override with `revert`.
-        await send('APPLY_STYLE', {
-          payload: { selector: sel, property: p.name, value: 'revert', elementLabel: state.selected.value },
-        });
-      } else {
-        // un-disable: remove our override entirely
-        const id = changeIdFor(rule.targetSelector, p.name);
-        await send('REVERT_CHANGE', { id });
-      }
     }
     await loadElementInfo();
     await loadChanges();
