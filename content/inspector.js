@@ -105,10 +105,18 @@
    *
    * The sidepanel lazily expands deeper nodes.
    */
+  function isOurNode(el) {
+    return el && el.nodeType === 1 && el.hasAttribute('data-desinspect');
+  }
+
+  function visibleChildren(el) {
+    return Array.from(el.children).filter((c) => !isOurNode(c));
+  }
+
   function serializeNode(el) {
     if (!(el instanceof Element)) return null;
     const sel = SelectorEngine.generate(el);
-    const childElements = Array.from(el.children);
+    const childElements = visibleChildren(el);
     return {
       selector: sel,
       tag: el.tagName.toLowerCase(),
@@ -127,7 +135,7 @@
   function getChildren(selectorObj) {
     const root = selectorObj ? SelectorEngine.find(selectorObj) : document.documentElement;
     if (!root) return [];
-    return Array.from(root.children).map(serializeNode).filter(Boolean);
+    return visibleChildren(root).map(serializeNode).filter(Boolean);
   }
 
   function getAncestors(selectorObj) {
@@ -136,10 +144,9 @@
     const out = [];
     let cur = start.parentElement;
     while (cur && cur !== document.documentElement) {
-      out.push(serializeNode(cur));
+      if (!isOurNode(cur)) out.push(serializeNode(cur));
       cur = cur.parentElement;
     }
-    out.push(serializeNode(document.documentElement));
     return out.reverse();
   }
 

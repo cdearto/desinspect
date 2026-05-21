@@ -54,7 +54,7 @@
         if (msg.data.selector) {
           state.selected = msg.data.selector;
           loadElementInfo();
-          highlightTreeSelection();
+          revealInTree(state.selected);
         }
         break;
       case 'CHANGES_LOADED':
@@ -320,6 +320,50 @@
     document.querySelectorAll('.tree-row[data-selector-key]').forEach((row) => {
       if (row.dataset.selectorKey === key) row.classList.add('selected');
     });
+  }
+
+  function findTreeNodeWrap(key) {
+    let found = null;
+    document.querySelectorAll('.tree-node[data-selector-key]').forEach((w) => {
+      if (w.dataset.selectorKey === key) found = w;
+    });
+    return found;
+  }
+
+  async function expandTreeNode(node) {
+    const key = selKey(node.selector);
+    const wrap = findTreeNodeWrap(key);
+    if (!wrap) return false;
+    const toggle = wrap.querySelector(':scope > .tree-row > .tree-toggle');
+    if (!toggle || !toggle.classList.contains('has-children')) return false;
+    if (toggle.classList.contains('expanded')) return true;
+    const indent = wrap.querySelector(':scope > .tree-row > .tree-indent');
+    const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
+    await toggleNode(node, wrap, toggle, depth);
+    return true;
+  }
+
+  /**
+   * Expand the tree down to the given selector and scroll it into view.
+   * Walks ancestors top-down, expanding each, then highlights the row.
+   */
+  async function revealInTree(selector) {
+    if (!selector) return;
+    const r = await send('GET_TREE_ANCESTORS', { selector });
+    const ancestors = r?.ancestors || [];
+    for (const anc of ancestors) {
+      await expandTreeNode(anc);
+    }
+    highlightTreeSelection();
+    const key = selKey(selector);
+    const row = (() => {
+      let f = null;
+      document.querySelectorAll('.tree-row[data-selector-key]').forEach((r2) => {
+        if (r2.dataset.selectorKey === key) f = r2;
+      });
+      return f;
+    })();
+    if (row) row.scrollIntoView({ block: 'center' });
   }
 
   function annotateTreeWithChanges() {
