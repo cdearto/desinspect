@@ -81,10 +81,13 @@
 
       <div class="tab-panel" data-panel="html">
         <div class="filter-row">
-          <span class="muted">Edit innerHTML</span>
+          <span class="muted">Edit outerHTML</span>
           <button id="btn-apply-html" class="link-btn primary">Apply (⌘↵)</button>
         </div>
-        <textarea id="html-editor" spellcheck="false" placeholder="Select an element..."></textarea>
+        <div class="html-editor-wrap">
+          <pre id="html-highlight" class="html-highlight" aria-hidden="true"></pre>
+          <textarea id="html-editor" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" placeholder="Select an element..."></textarea>
+        </div>
       </div>
 
       <div class="tab-panel" data-panel="changes">
