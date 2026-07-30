@@ -9,7 +9,7 @@
  */
 
 const SelectorEngine = (() => {
-  const VOLATILE_CLASS_RE = /^(css-|sc-|jsx-|ng-|_|tw-|chakra-|mui-)/i;
+  const VOLATILE_CLASS_RE = /^(css-|sc-|jsx-|ng-|_|tw-|chakra-|mui-|desinspect-)/i;
   const VOLATILE_ID_RE = /^(ember|react|radix|headlessui|sn|__|sb-)/i;
 
   function isVolatileClass(c) {

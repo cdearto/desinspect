@@ -254,6 +254,100 @@ const StylesEngine = (() => {
     }
   }
 
+  // ─── Force element state (:hov) ────────────────────────────────────────────
+  //
+  // DevTools can force :hover/:focus/etc. through the CDP; from a content
+  // script we approximate: collect every author rule whose selector uses a
+  // forced pseudo, rewrite that pseudo to a marker class
+  // (:hover → .desinspect-fs-hover), install the rewritten rules in an
+  // ephemeral (never persisted) stylesheet, and add the marker classes to
+  // the target element. Descendant rules like `.btn:hover .icon` work
+  // naturally because the class lands on the element the pseudo targeted.
+
+  const FORCEABLE = ['hover', 'focus', 'focus-within', 'focus-visible', 'active'];
+  const FORCED_SHEET_ID = 'desinspect-forced-states';
+  let _forcedEl = null;
+
+  function forcedClass(state) {
+    return `desinspect-fs-${state}`;
+  }
+
+  function rewriteSelectorForStates(selector, states) {
+    let out = selector;
+    let touched = false;
+    for (const s of states) {
+      const re = new RegExp(`:${s}(?![\\w-])`, 'g');
+      if (re.test(out)) {
+        out = out.replace(re, `.${forcedClass(s)}`);
+        touched = true;
+      }
+    }
+    return touched ? out : null;
+  }
+
+  function collectRulesWithPseudos(rules, states, acc) {
+    for (const rule of Array.from(rules || [])) {
+      if (rule.type === 1 || rule.constructor.name === 'CSSStyleRule') {
+        const rewritten = rewriteSelectorForStates(rule.selectorText, states);
+        if (rewritten) {
+          const body = rule.cssText.replace(/^[^{]*\{/, '').replace(/\}\s*$/, '');
+          acc.push(`${rewritten} { ${body} }`);
+        }
+      } else if (rule.type === 4 || rule.constructor.name === 'CSSMediaRule') {
+        let media = null;
+        try { media = rule.media?.mediaText; } catch {}
+        if (media && !window.matchMedia(media).matches) continue;
+        collectRulesWithPseudos(rule.cssRules, states, acc);
+      } else if (rule.cssRules && rule.cssRules.length) {
+        collectRulesWithPseudos(rule.cssRules, states, acc);
+      }
+    }
+  }
+
+  /**
+   * Force pseudo-states on an element. `states` is the full desired set —
+   * pass [] to clear. Only one element carries forced states at a time.
+   */
+  async function forceStates(el, states) {
+    // Clear previous target's classes.
+    if (_forcedEl && _forcedEl !== el) {
+      for (const s of FORCEABLE) _forcedEl.classList.remove(forcedClass(s));
+    }
+    _forcedEl = el || null;
+
+    let sheetEl = document.getElementById(FORCED_SHEET_ID);
+    if (!states.length || !el) {
+      if (sheetEl) sheetEl.textContent = '';
+      if (el) for (const s of FORCEABLE) el.classList.remove(forcedClass(s));
+      return { forced: [] };
+    }
+
+    if (!sheetEl) {
+      sheetEl = document.createElement('style');
+      sheetEl.id = FORCED_SHEET_ID;
+      sheetEl.setAttribute('data-desinspect', 'true');
+      document.documentElement.appendChild(sheetEl);
+    }
+
+    const acc = [];
+    for (const sheet of Array.from(document.styleSheets)) {
+      if (sheet.ownerNode?.id === FORCED_SHEET_ID) continue;
+      const rules = safeRules(sheet);
+      if (rules) {
+        collectRulesWithPseudos(rules, states, acc);
+      } else if (sheet.href) {
+        const synth = await fetchAsStylesheet(sheet.href);
+        if (synth) collectRulesWithPseudos(synth.cssRules, states, acc);
+      }
+    }
+    sheetEl.textContent = acc.join('\n');
+
+    for (const s of FORCEABLE) {
+      el.classList.toggle(forcedClass(s), states.includes(s));
+    }
+    return { forced: states };
+  }
+
   function computedSnapshot(el) {
     const cs = window.getComputedStyle(el);
     const out = {};
@@ -301,6 +395,8 @@ const StylesEngine = (() => {
     computedSnapshot,
     boxModel,
     parseProps,
+    forceStates,
+    FORCEABLE,
   };
 })();
 

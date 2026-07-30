@@ -217,6 +217,8 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
 }
 .tree-row:hover { background: var(--bg-row-hover); }
 .tree-row.selected { background: var(--bg-row-selected); }
+.tree:focus { outline: none; }
+.tree:focus .tree-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 .tree-indent { display: inline-block; }
 .tree-toggle {
@@ -291,6 +293,92 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   align-items: center;
   justify-content: flex-end;
   font-size: 10px;
+}
+
+/* ─── Breadcrumbs ───────────────────────────────────────────────────────── */
+
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  min-height: 22px;
+  padding: 2px 8px;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+.breadcrumbs::-webkit-scrollbar { display: none; }
+.breadcrumbs:empty { display: none; }
+.crumb {
+  color: var(--text-dim);
+  padding: 1px 4px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.crumb:hover { background: var(--bg-row-hover); color: var(--text); }
+.crumb.current { color: var(--accent); }
+.crumb-sep { color: var(--text-muted); }
+
+/* ─── Context menu ──────────────────────────────────────────────────────── */
+
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 180px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  font-size: 11px;
+}
+.ctx-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 5px 12px;
+  text-align: left;
+  color: var(--text);
+  cursor: pointer;
+}
+.ctx-item:hover { background: var(--bg-row-selected); }
+.ctx-item .ctx-key { color: var(--text-muted); font-size: 10px; }
+.ctx-item.danger { color: var(--danger); }
+.ctx-sep { height: 1px; background: var(--border-subtle); margin: 4px 0; }
+
+/* ─── Force-state row ───────────────────────────────────────────────────── */
+
+.hov-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--mono);
+}
+.hov-row .check { font-size: 10px; }
+.link-btn.active { background: var(--accent); color: var(--bg); }
+
+/* ─── New rule editor ───────────────────────────────────────────────────── */
+
+.new-rule-selector {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--selector);
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 2px 6px;
+  outline: none;
 }
 
 /* ─── Tabs ──────────────────────────────────────────────────────────────── */

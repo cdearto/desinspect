@@ -1,12 +1,9 @@
 /**
  * DesInspect — Inspector (content script entry).
  *
- * Drives the page side of the inspector: picker mode (hover-to-highlight,
- * click-to-select), DOM-tree serialization for the sidepanel, applying
- * edits, and routing messages from the sidepanel via the SW.
- *
- * The selected element is tracked here so subsequent style edits target
- * the right node without re-resolving every message.
+ * Page side of the inspector: picker mode, DOM-tree serialization,
+ * element info, edits (style/HTML/delete/duplicate), forced states,
+ * undo/redo, and the message router for the sidepanel.
  */
 
 (() => {
@@ -14,22 +11,36 @@
   let _selected = null;
   let _selectedSelector = null;
 
+  const MARKER_CLASS_RE = /desinspect-fs-[a-z-]+/g;
+
+  function stripMarkers(s) {
+    if (!s) return s;
+    return s
+      .replace(/class="([^"]*)"/g, (full, cls) => {
+        const cleaned = cls.replace(MARKER_CLASS_RE, '').replace(/\s+/g, ' ').trim();
+        return cleaned ? `class="${cleaned}"` : '';
+      })
+      .replace(/\s+>/g, '>');
+  }
+
+  function cleanClasses(el) {
+    return Array.from(el.classList || []).filter((c) => !c.startsWith('desinspect-fs-'));
+  }
+
   // ─── Picker ────────────────────────────────────────────────────────────────
 
   function onMouseOver(e) {
-    if (!_pickerActive) return;
-    if (isOurs(e.target)) return;
+    if (!_pickerActive || isOurs(e.target)) return;
     Overlay.showHover(e.target);
   }
 
-  function onMouseOut(e) {
+  function onMouseOut() {
     if (!_pickerActive) return;
     Overlay.showHover(null);
   }
 
   function onClick(e) {
-    if (!_pickerActive) return;
-    if (isOurs(e.target)) return;
+    if (!_pickerActive || isOurs(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     selectElement(e.target);
@@ -71,6 +82,10 @@
   // ─── Selection ─────────────────────────────────────────────────────────────
 
   function selectElement(el) {
+    // Selection change clears any forced pseudo-states on the old element.
+    if (_selected && _selected !== el) {
+      StylesEngine.forceStates(null, []);
+    }
     if (!el) {
       _selected = null;
       _selectedSelector = null;
@@ -91,20 +106,22 @@
     return {
       tag: el.tagName.toLowerCase(),
       id: el.id || null,
-      classes: Array.from(el.classList || []),
-      attributes: Array.from(el.attributes || []).map((a) => ({ name: a.name, value: a.value })),
+      classes: cleanClasses(el),
+      attributes: Array.from(el.attributes || [])
+        .filter((a) => !a.name.startsWith('data-desinspect'))
+        .map((a) => ({
+          name: a.name,
+          value: a.name === 'class'
+            ? a.value.replace(MARKER_CLASS_RE, '').replace(/\s+/g, ' ').trim()
+            : a.value,
+        }))
+        .filter((a) => !(a.name === 'class' && !a.value)),
       text: (el.textContent || '').trim().slice(0, 120),
     };
   }
 
   // ─── DOM tree serialization ────────────────────────────────────────────────
 
-  /**
-   * Serialize an element and one level of children for the sidepanel tree.
-   * Each node has: { selector, tag, id, classes, childCount, hasContent }.
-   *
-   * The sidepanel lazily expands deeper nodes.
-   */
   function isOurNode(el) {
     return el && el.nodeType === 1 && el.hasAttribute('data-desinspect');
   }
@@ -117,11 +134,13 @@
     if (!(el instanceof Element)) return null;
     const sel = SelectorEngine.generate(el);
     const childElements = visibleChildren(el);
+    const d = describeElement(el);
     return {
       selector: sel,
-      tag: el.tagName.toLowerCase(),
-      id: el.id || null,
-      classes: Array.from(el.classList || []),
+      tag: d.tag,
+      id: d.id,
+      classes: d.classes,
+      attrs: d.attributes,
       childCount: childElements.length,
       hasText:
         childElements.length === 0 &&
@@ -150,7 +169,7 @@
     return out.reverse();
   }
 
-  // ─── Element info for sidepanel ────────────────────────────────────────────
+  // ─── Element info ──────────────────────────────────────────────────────────
 
   async function elementInfo(selectorObj) {
     const el = selectorObj ? SelectorEngine.find(selectorObj) : _selected;
@@ -162,8 +181,8 @@
       matched: await StylesEngine.matchedRules(el),
       computed: StylesEngine.computedSnapshot(el),
       box: StylesEngine.boxModel(el),
-      outerHTML: el.outerHTML.length < 50000 ? el.outerHTML : null,
-      innerHTML: el.innerHTML.length < 50000 ? el.innerHTML : null,
+      outerHTML: el.outerHTML.length < 50000 ? stripMarkers(el.outerHTML) : null,
+      innerHTML: el.innerHTML.length < 50000 ? stripMarkers(el.innerHTML) : null,
     };
   }
 
@@ -190,6 +209,54 @@
       originalValue,
       elementTag: _selected?.tagName?.toLowerCase() || null,
       elementLabel: elementLabel || null,
+    });
+  }
+
+  /**
+   * Delete an element from the DOM, persisted. Stores restore info
+   * (parent selector + child index + outerHTML) so revert/undo can
+   * re-insert it at the same position.
+   */
+  function deleteElement(selectorObj) {
+    const el = SelectorEngine.find(selectorObj);
+    if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
+    const parent = el.parentElement;
+    const parentSel = SelectorEngine.generate(parent);
+    const childIndex = Array.from(parent.children).indexOf(el);
+    if (_selected === el) selectElement(null);
+    return Persistence.saveChange({
+      selector: selectorObj.value,
+      selectorType: selectorObj.type,
+      property: '__remove__',
+      value: '1',
+      originalValue: stripMarkers(el.outerHTML),
+      parentSelector: parentSel.value,
+      parentSelectorType: parentSel.type,
+      childIndex,
+      elementTag: el.tagName.toLowerCase(),
+    });
+  }
+
+  /**
+   * Duplicate an element: insert a clone after it, persisted as an
+   * __html__ edit on the parent (its outerHTML captures the duplication).
+   */
+  function duplicateElement(selectorObj) {
+    const el = SelectorEngine.find(selectorObj);
+    if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
+    const parent = el.parentElement;
+    const parentSel = SelectorEngine.generate(parent);
+    const before = stripMarkers(parent.outerHTML);
+    Persistence.markOurMutation();
+    el.insertAdjacentHTML('afterend', stripMarkers(el.outerHTML));
+    const after = stripMarkers(parent.outerHTML);
+    return Persistence.saveChange({
+      selector: parentSel.value,
+      selectorType: parentSel.type,
+      property: '__html__',
+      value: after,
+      originalValue: before,
+      elementTag: parent.tagName.toLowerCase(),
     });
   }
 
@@ -245,8 +312,25 @@
         return await applyStyleEdit(msg.payload);
       case 'APPLY_HTML':
         return await applyHtmlEdit(msg.payload);
+      case 'DELETE_ELEMENT':
+        return await deleteElement(msg.selector);
+      case 'DUPLICATE_ELEMENT':
+        return await duplicateElement(msg.selector);
+      case 'FORCE_STATE': {
+        const el = SelectorEngine.find(msg.selector) || _selected;
+        return await StylesEngine.forceStates(el, msg.states || []);
+      }
+      case 'UNDO':
+        return await Persistence.undo();
+      case 'REDO':
+        return await Persistence.redo();
+      case 'GET_UNDO_STATE':
+        return Persistence.getUndoState();
       case 'REVERT_CHANGE':
         await Persistence.deleteChange(msg.id);
+        return { ok: true };
+      case 'REVERT_PROP':
+        await Persistence.deleteChangeByProp(msg.selector, msg.property);
         return { ok: true };
       case 'REVERT_ALL':
         await Persistence.clearAll();
@@ -264,11 +348,7 @@
         const snaps = await PersistDB.getSnapshotsForUrl(location.href);
         const snap = snaps.find((s) => s.id === msg.id);
         if (!snap) throw new Error('snapshot not found');
-        await Persistence.clearAll();
-        for (const c of snap.changes) {
-          await PersistDB.putChange({ ...c, urlPattern: PersistDB.normalizeUrl(location.href) });
-        }
-        await Persistence.reapply();
+        await Persistence.restoreSnapshot(snap.changes || []);
         return { ok: true };
       }
       default:
@@ -280,11 +360,8 @@
 
   Persistence.init();
 
-  // Reposition overlays on layout shifts of the selected element
   const ro = new ResizeObserver(() => Overlay.refreshSelected());
   ro.observe(document.documentElement);
-
-  // Periodic redraw — cheap insurance against transitions
   setInterval(() => Overlay.refreshSelected(), 1000);
 
   console.log('[DesInspect] inspector loaded on', location.href);

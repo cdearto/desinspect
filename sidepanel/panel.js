@@ -1,15 +1,13 @@
 /**
  * DesInspect — Side panel UI controller.
  *
- * Drives a DevTools-Elements-like UI: collapsible DOM tree, Styles tab with
- * inline-editable rules, Computed tab, Box-model diagram, HTML editor,
- * Changes list, and Snapshots.
+ * DevTools-Elements-style UI: collapsible DOM tree with keyboard navigation,
+ * context menu, and breadcrumbs; Styles tab with inline-editable rules and
+ * forced element states (:hov); Computed tab with box model; Changes and
+ * Snapshots tabs; undo/redo over every persisted edit.
  *
- * Communication: every page-side action goes through `send(type, payload)`,
- * which posts a runtime message that's forwarded to the active tab's content
- * script by the service worker. Page → panel pushes (PICKER_STATE,
- * ELEMENT_SELECTED, CHANGES_LOADED, CHANGE_SAVED…) are received via
- * chrome.runtime.onMessage.
+ * All page-side actions go through `send(type, payload)` → service worker →
+ * content script. Page → panel pushes arrive via chrome.runtime.onMessage.
  */
 
 (() => {
@@ -23,9 +21,28 @@
     changes: [],                // current URL's persisted changes
     snapshots: [],
     activeTab: 'styles',
-    undoStack: [],              // panel-side; mirrors changes for ⌘Z
-    redoStack: [],
+    forcedStates: [],           // active :hov forced states
+    ancestors: [],              // breadcrumb chain for current selection
   };
+
+  const CSS_PROPS = [
+    'align-content','align-items','align-self','animation','appearance','aspect-ratio',
+    'backdrop-filter','background','background-color','background-image','background-position',
+    'background-repeat','background-size','border','border-bottom','border-color','border-left',
+    'border-radius','border-right','border-style','border-top','border-width','bottom',
+    'box-shadow','box-sizing','clip-path','color','column-gap','content','cursor','display',
+    'filter','flex','flex-basis','flex-direction','flex-grow','flex-shrink','flex-wrap','float',
+    'font','font-family','font-size','font-style','font-weight','gap','grid','grid-area',
+    'grid-column','grid-gap','grid-row','grid-template-columns','grid-template-rows','height',
+    'inset','justify-content','justify-items','justify-self','left','letter-spacing',
+    'line-height','list-style','margin','margin-bottom','margin-left','margin-right',
+    'margin-top','max-height','max-width','min-height','min-width','object-fit','opacity',
+    'order','outline','overflow','overflow-x','overflow-y','padding','padding-bottom',
+    'padding-left','padding-right','padding-top','pointer-events','position','right',
+    'row-gap','text-align','text-decoration','text-overflow','text-shadow','text-transform',
+    'top','transform','transform-origin','transition','user-select','vertical-align',
+    'visibility','white-space','width','word-break','z-index',
+  ];
 
   // ─── Messaging ──────────────────────────────────────────────────────────
 
@@ -52,10 +69,9 @@
       case 'ELEMENT_SELECTED':
         if (msg.data.selector) {
           state.selected = msg.data.selector;
+          state.forcedStates = [];
+          syncHovUI();
           loadElementInfo();
-          // If the initial tree fetch raced the content script and came back
-          // empty, the user clearly has a working content script now (they
-          // just picked something), so try the root again.
           if (!state.tree.rootChildren.length) {
             refreshTreeRoot().then(() => revealInTree(state.selected));
           } else {
@@ -73,8 +89,14 @@
       case 'ALL_CLEARED':
         loadChanges();
         break;
+      case 'UNDO_STATE':
+        setUndoButtons(msg.data.canUndo, msg.data.canRedo);
+        break;
+      case 'HISTORY_APPLIED':
+        setStatus(`${msg.data.direction === 'undo' ? 'Undid' : 'Redid'}: ${msg.data.label}`);
+        refreshAfterMutation();
+        break;
       case 'URL_CHANGED':
-        // page navigated — reload everything
         setTimeout(initFromTab, 200);
         break;
     }
@@ -84,6 +106,21 @@
     document.getElementById('status').textContent = text;
   }
 
+  function setUndoButtons(canUndo, canRedo) {
+    document.getElementById('btn-undo').disabled = !canUndo;
+    document.getElementById('btn-redo').disabled = !canRedo;
+  }
+
+  /** Everything that needs re-syncing after a page-side mutation. */
+  async function refreshAfterMutation() {
+    await loadChanges();
+    await refreshTreeRoot();
+    if (state.selected) {
+      await loadElementInfo();
+      await revealInTree(state.selected, { scroll: false });
+    }
+  }
+
   // ─── Init ────────────────────────────────────────────────────────────────
 
   async function initFromTab() {
@@ -91,26 +128,21 @@
     state.selectedInfo = null;
     state.tree.expanded.clear();
     state.tree.nodesBySelector.clear();
-    state.undoStack = [];
-    state.redoStack = [];
+    state.forcedStates = [];
+    state.ancestors = [];
+    syncHovUI();
+    renderBreadcrumbs();
 
-    // Render skeleton tree (html → body)
     await refreshTreeRoot();
     await loadChanges();
     await loadSnapshots();
+    const u = await send('GET_UNDO_STATE');
+    if (u) setUndoButtons(u.canUndo, u.canRedo);
     setStatus('No element selected');
   }
 
-  /**
-   * Re-fetch the DOM tree from the page. Preserves which selector keys
-   * were expanded, but invalidates their cached child lists so they get
-   * re-fetched on render — that's what lets the tree reflect HTML edits
-   * without the user clicking "refresh".
-   */
   async function refreshTreeRoot({ invalidateCache = true } = {}) {
-    // The content script may not be live yet when the side panel first opens
-    // (especially on slow/initial loads). Retry with short backoff so we
-    // don't strand the user on an empty tree.
+    // The content script may not be live yet when the panel first opens.
     let r = null;
     for (let i = 0; i < 5; i++) {
       r = await send('GET_TREE_CHILDREN', { selector: null });
@@ -118,6 +150,8 @@
       await new Promise((res) => setTimeout(res, 200));
     }
     if (invalidateCache) {
+      // Keep which nodes are expanded but drop their cached child lists so
+      // HTML edits show up without a manual refresh.
       for (const key of Array.from(state.tree.expanded.keys())) {
         if (Array.isArray(state.tree.expanded.get(key))) {
           state.tree.expanded.set(key, true);
@@ -208,23 +242,23 @@
       row.appendChild(renderCloseTag(node));
     }
 
-    // Modified marker placeholder
     const dot = document.createElement('span');
     dot.className = 'tree-modified-marker';
     row.appendChild(dot);
 
     row.addEventListener('mouseenter', () => send('HIGHLIGHT', { selector: node.selector }));
     row.addEventListener('mouseleave', () => send('UNHIGHLIGHT'));
-    row.addEventListener('click', () => {
-      send('SELECT', { selector: node.selector });
-      state.selected = node.selector;
-      loadElementInfo();
-      highlightTreeSelection();
-    });
+    row.addEventListener('click', () => selectNode(node));
     row.addEventListener('dblclick', (e) => {
       e.preventDefault();
       e.stopPropagation();
       startInlineHtmlEdit(node, row);
+    });
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      selectNode(node);
+      openContextMenu(e.clientX, e.clientY, node, row);
     });
 
     wrap.appendChild(row);
@@ -233,21 +267,19 @@
       const childContainer = document.createElement('div');
       childContainer.className = 'tree-children';
       wrap.appendChild(childContainer);
-      // children may already be loaded
       const cached = state.tree.expanded.get(key);
       if (Array.isArray(cached)) {
         for (const c of cached) childContainer.appendChild(renderTreeNode(c, depth + 1));
       } else {
-        // load asynchronously
         send('GET_TREE_CHILDREN', { selector: node.selector }).then((r) => {
           const children = r?.nodes || [];
           state.tree.expanded.set(key, children);
           childContainer.innerHTML = '';
           for (const c of children) childContainer.appendChild(renderTreeNode(c, depth + 1));
           annotateTreeWithChanges();
+          highlightTreeSelection();
         });
       }
-      // After children, the closing tag at parent's indent level
       const closingRow = document.createElement('div');
       closingRow.className = 'tree-row tree-close-row';
       const ind = document.createElement('span');
@@ -264,6 +296,16 @@
     return wrap;
   }
 
+  function selectNode(node) {
+    send('SELECT', { selector: node.selector });
+    state.selected = node.selector;
+    state.forcedStates = [];
+    syncHovUI();
+    loadElementInfo();
+    highlightTreeSelection();
+    loadBreadcrumbs();
+  }
+
   async function toggleNode(node, wrap, toggle, depth) {
     const key = selKey(node.selector);
     const isExpanded = toggle.classList.contains('expanded');
@@ -271,12 +313,10 @@
       state.tree.expanded.delete(key);
       toggle.classList.remove('expanded');
       toggle.classList.add('collapsed');
-      // remove children container + closing row
       const children = wrap.querySelector('.tree-children');
       if (children) children.remove();
       const closeRow = wrap.querySelector('.tree-close-row');
       if (closeRow) closeRow.remove();
-      // restore inline "…</tag>" on the row
       const row = wrap.querySelector('.tree-row');
       row.querySelector('.tree-close')?.remove();
       const dots = document.createElement('span');
@@ -285,17 +325,12 @@
       row.appendChild(dots);
       row.appendChild(renderCloseTag(node));
     } else {
-      // expand
       state.tree.expanded.set(key, true);
       toggle.classList.remove('collapsed');
       toggle.classList.add('expanded');
-      // remove the inline "…</tag>" on the row
       const row = wrap.querySelector('.tree-row');
-      row.querySelector('.tree-close')?.remove();
-      const closes = row.querySelectorAll('.tree-close');
-      closes.forEach((n) => n.remove());
+      row.querySelectorAll('.tree-close').forEach((n) => n.remove());
 
-      // ensure no duplicate child container
       let cc = wrap.querySelector('.tree-children');
       if (cc) cc.remove();
       cc = document.createElement('div');
@@ -308,7 +343,6 @@
       cc.innerHTML = '';
       for (const c of children) cc.appendChild(renderTreeNode(c, depth + 1));
 
-      // append closing row
       const closingRow = document.createElement('div');
       closingRow.className = 'tree-row tree-close-row';
       const ind = document.createElement('span');
@@ -322,19 +356,27 @@
       wrap.appendChild(closingRow);
 
       annotateTreeWithChanges();
+      highlightTreeSelection();
     }
   }
 
   function renderOpenTag(node) {
     const span = document.createElement('span');
-    span.innerHTML =
-      `<span class="tree-open">&lt;</span>` +
-      `<span class="tree-tag">${node.tag}</span>` +
-      (node.id ? ` <span class="tree-attr-name">id</span>=<span class="tree-attr-value">"${escapeHtml(node.id)}"</span>` : '') +
-      (node.classes && node.classes.length
-        ? ` <span class="tree-attr-name">class</span>=<span class="tree-attr-value">"${escapeHtml(node.classes.join(' '))}"</span>`
-        : '') +
-      `<span class="tree-open">&gt;</span>`;
+    let html = `<span class="tree-open">&lt;</span><span class="tree-tag">${node.tag}</span>`;
+    const attrs = node.attrs && node.attrs.length
+      ? node.attrs
+      : [
+          ...(node.id ? [{ name: 'id', value: node.id }] : []),
+          ...(node.classes && node.classes.length ? [{ name: 'class', value: node.classes.join(' ') }] : []),
+        ];
+    for (const a of attrs) {
+      html += ` <span class="tree-attr-name">${escapeHtml(a.name)}</span>`;
+      if (a.value !== '' || a.name === 'class' || a.name === 'id') {
+        html += `=<span class="tree-attr-value">"${escapeHtml(truncate(a.value, 50))}"</span>`;
+      }
+    }
+    html += `<span class="tree-open">&gt;</span>`;
+    span.innerHTML = html;
     return span;
   }
 
@@ -344,12 +386,9 @@
     return span;
   }
 
-  /**
-   * Double-click handler on a tree row: swap the row contents for an inline
-   * outerHTML editor. Enter (or ⌘↵) commits, Esc cancels.
-   */
+  // ─── Inline HTML editor (double-click / F2) ─────────────────────────────
+
   async function startInlineHtmlEdit(node, row) {
-    // Don't double-trigger if already editing this row
     if (row.classList.contains('editing')) return;
 
     const info = await send('GET_ELEMENT_INFO', { selector: node.selector });
@@ -360,16 +399,9 @@
     const raw = info.outerHTML;
     const pretty = prettyHtml(raw);
 
-    // Stash the original row markup so we can restore on cancel
     const original = row.innerHTML;
     row.classList.add('editing');
     row.innerHTML = '';
-
-    const indent = document.createElement('span');
-    indent.className = 'tree-indent';
-    // Match the depth of the row being replaced (best-effort: copy from sibling)
-    // The row in the tree carries no depth attribute, so we just leave 0 indent.
-    row.appendChild(indent);
 
     const wrap = document.createElement('div');
     wrap.className = 'tree-edit-wrap';
@@ -384,7 +416,7 @@
     actions.className = 'tree-edit-actions';
     const applyBtn = document.createElement('button');
     applyBtn.className = 'link-btn primary';
-    applyBtn.textContent = 'Apply (↵)';
+    applyBtn.textContent = 'Apply (⌘↵)';
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'link-btn';
     cancelBtn.textContent = 'Cancel (Esc)';
@@ -407,14 +439,9 @@
       if (done) return;
       done = true;
       const newHtml = ta.value;
-      if (newHtml.trim() === pretty.trim() || newHtml.trim() === raw.trim()) {
-        // no change
-        row.classList.remove('editing');
-        row.innerHTML = original;
-        return;
-      }
       row.classList.remove('editing');
       row.innerHTML = original;
+      if (newHtml.trim() === pretty.trim() || newHtml.trim() === raw.trim()) return;
       await send('APPLY_HTML', {
         payload: {
           selector: node.selector,
@@ -423,35 +450,27 @@
           elementLabel: node.selector.value,
         },
       });
-      await loadChanges();
-      // The replaced element may have a different selector now; re-fetch
-      // the tree and reload element info if it was selected.
-      await refreshTreeRoot();
-      if (state.selected) {
-        await loadElementInfo();
-        revealInTree(state.selected);
-      }
+      await refreshAfterMutation();
       setStatus('HTML applied');
     };
 
     ta.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // keep tree keyboard nav out of the editor
       if (e.key === 'Escape') {
         e.preventDefault();
         cancel();
       } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         commit();
+      } else if (e.key === 'Tab') {
+        e.preventDefault();
+        const start = ta.selectionStart;
+        ta.value = ta.value.slice(0, start) + '  ' + ta.value.slice(ta.selectionEnd);
+        ta.selectionStart = ta.selectionEnd = start + 2;
       }
     });
-    applyBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      commit();
-    });
-    cancelBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      cancel();
-    });
-    // Clicking outside the edit area cancels (unless they hit Apply)
+    applyBtn.addEventListener('click', (e) => { e.stopPropagation(); commit(); });
+    cancelBtn.addEventListener('click', (e) => { e.stopPropagation(); cancel(); });
     const onDocClick = (e) => {
       if (done) {
         document.removeEventListener('mousedown', onDocClick, true);
@@ -465,14 +484,16 @@
     setTimeout(() => document.addEventListener('mousedown', onDocClick, true), 0);
   }
 
+  // ─── Tree helpers ───────────────────────────────────────────────────────
+
   function highlightTreeSelection() {
     document.querySelectorAll('.tree-row.selected').forEach((r) => r.classList.remove('selected'));
     if (!state.selected) return;
     const key = selKey(state.selected);
-    // Linear scan: CSS.escape over-escapes for attribute values, and dataset
-    // matching keeps things straightforward.
     document.querySelectorAll('.tree-row[data-selector-key]').forEach((row) => {
-      if (row.dataset.selectorKey === key) row.classList.add('selected');
+      if (row.dataset.selectorKey === key && !row.classList.contains('tree-close-row')) {
+        row.classList.add('selected');
+      }
     });
   }
 
@@ -480,6 +501,14 @@
     let found = null;
     document.querySelectorAll('.tree-node[data-selector-key]').forEach((w) => {
       if (w.dataset.selectorKey === key) found = w;
+    });
+    return found;
+  }
+
+  function findTreeRow(key) {
+    let found = null;
+    document.querySelectorAll('.tree-row[data-selector-key]').forEach((r) => {
+      if (r.dataset.selectorKey === key && !r.classList.contains('tree-close-row')) found = r;
     });
     return found;
   }
@@ -497,37 +526,76 @@
     return true;
   }
 
-  /**
-   * Expand the tree down to the given selector and scroll it into view.
-   * Walks ancestors top-down, expanding each, then highlights the row.
-   */
-  async function revealInTree(selector) {
+  async function revealInTree(selector, { scroll = true } = {}) {
     if (!selector) return;
     const r = await send('GET_TREE_ANCESTORS', { selector });
     const ancestors = r?.ancestors || [];
+    state.ancestors = ancestors;
+    renderBreadcrumbs();
     for (const anc of ancestors) {
       await expandTreeNode(anc);
     }
     highlightTreeSelection();
-    const key = selKey(selector);
-    const row = (() => {
-      let f = null;
-      document.querySelectorAll('.tree-row[data-selector-key]').forEach((r2) => {
-        if (r2.dataset.selectorKey === key) f = r2;
-      });
-      return f;
-    })();
-    if (row) row.scrollIntoView({ block: 'center' });
+    if (scroll) {
+      const row = findTreeRow(selKey(selector));
+      if (row) row.scrollIntoView({ block: 'center' });
+    }
+  }
+
+  async function loadBreadcrumbs() {
+    if (!state.selected) {
+      state.ancestors = [];
+      renderBreadcrumbs();
+      return;
+    }
+    const r = await send('GET_TREE_ANCESTORS', { selector: state.selected });
+    state.ancestors = r?.ancestors || [];
+    renderBreadcrumbs();
+  }
+
+  function crumbLabel(node) {
+    let label = node.tag;
+    if (node.id) label += `#${node.id}`;
+    else if (node.classes && node.classes.length) label += `.${node.classes[0]}`;
+    return label;
+  }
+
+  function renderBreadcrumbs() {
+    const bar = document.getElementById('breadcrumbs');
+    bar.innerHTML = '';
+    if (!state.selected) return;
+    const chain = [...state.ancestors];
+    const selfNode = state.tree.nodesBySelector.get(selKey(state.selected)) || {
+      selector: state.selected,
+      tag: state.selectedInfo?.describe?.tag || state.selected.value,
+      id: state.selectedInfo?.describe?.id || null,
+      classes: state.selectedInfo?.describe?.classes || [],
+    };
+    chain.push(selfNode);
+    chain.forEach((node, i) => {
+      const crumb = document.createElement('span');
+      crumb.className = 'crumb' + (i === chain.length - 1 ? ' current' : '');
+      crumb.textContent = crumbLabel(node);
+      crumb.addEventListener('click', () => selectNode(node));
+      crumb.addEventListener('mouseenter', () => send('HIGHLIGHT', { selector: node.selector }));
+      crumb.addEventListener('mouseleave', () => send('UNHIGHLIGHT'));
+      bar.appendChild(crumb);
+      if (i < chain.length - 1) {
+        const sep = document.createElement('span');
+        sep.className = 'crumb-sep';
+        sep.textContent = ' › ';
+        bar.appendChild(sep);
+      }
+    });
+    bar.scrollLeft = bar.scrollWidth;
   }
 
   function annotateTreeWithChanges() {
     document.querySelectorAll('.tree-modified-marker').forEach((m) => (m.innerHTML = ''));
     const sels = new Set(state.changes.map((c) => c.selector));
     for (const sel of sels) {
-      // selector strings only — find rows matching by selector.value
       document.querySelectorAll('.tree-row[data-selector-key]').forEach((row) => {
-        const k = row.dataset.selectorKey;
-        const parsed = parseSelKey(k);
+        const parsed = parseSelKey(row.dataset.selectorKey);
         if (parsed && parsed.value === sel) {
           const marker = row.querySelector('.tree-modified-marker');
           if (marker && !marker.innerHTML) {
@@ -538,7 +606,213 @@
     }
   }
 
-  // ─── Selected element info → render Styles/Computed/Box/HTML ────────────
+  // ─── DOM control actions ────────────────────────────────────────────────
+
+  async function deleteSelectedElement(selector) {
+    const target = selector || state.selected;
+    if (!target) return;
+    await send('DELETE_ELEMENT', { selector: target });
+    if (state.selected && selKey(state.selected) === selKey(target)) {
+      state.selected = null;
+      state.selectedInfo = null;
+      renderStyles();
+      renderComputed();
+      renderBox();
+    }
+    await refreshAfterMutation();
+    setStatus('Element deleted (undo with ⌘Z)');
+  }
+
+  async function duplicateElement(selector) {
+    const target = selector || state.selected;
+    if (!target) return;
+    await send('DUPLICATE_ELEMENT', { selector: target });
+    await refreshAfterMutation();
+    setStatus('Element duplicated');
+  }
+
+  function isHidden(selector) {
+    return state.changes.some(
+      (c) => c.selector === selector.value && c.property === 'visibility' && c.value === 'hidden' && !c.disabled
+    );
+  }
+
+  async function toggleHideElement(selector) {
+    const target = selector || state.selected;
+    if (!target) return;
+    if (isHidden(target)) {
+      await send('REVERT_PROP', { selector: target.value, property: 'visibility' });
+      setStatus('Element shown');
+    } else {
+      await send('APPLY_STYLE', {
+        payload: { selector: target, property: 'visibility', value: 'hidden', elementLabel: target.value },
+      });
+      setStatus('Element hidden (H to show)');
+    }
+    await loadChanges();
+    if (state.selected) await loadElementInfo();
+  }
+
+  // ─── Context menu ───────────────────────────────────────────────────────
+
+  function openContextMenu(x, y, node, row) {
+    const menu = document.getElementById('ctx-menu');
+    menu.innerHTML = '';
+    const hidden = isHidden(node.selector);
+
+    const items = [
+      { label: 'Edit as HTML', key: 'F2', act: () => startInlineHtmlEdit(node, row) },
+      { label: 'Duplicate element', key: '', act: () => duplicateElement(node.selector) },
+      { label: hidden ? 'Show element' : 'Hide element', key: 'H', act: () => toggleHideElement(node.selector) },
+      { label: 'Delete element', key: '⌫', danger: true, act: () => deleteSelectedElement(node.selector) },
+      { sep: true },
+      { label: 'Copy selector', key: '', act: () => copyText(node.selector.value) },
+      { label: 'Copy outerHTML', key: '', act: async () => {
+          const info = await send('GET_ELEMENT_INFO', { selector: node.selector });
+          if (info?.outerHTML) copyText(info.outerHTML);
+        } },
+    ];
+
+    for (const item of items) {
+      if (item.sep) {
+        const sep = document.createElement('div');
+        sep.className = 'ctx-sep';
+        menu.appendChild(sep);
+        continue;
+      }
+      const btn = document.createElement('button');
+      btn.className = 'ctx-item' + (item.danger ? ' danger' : '');
+      btn.innerHTML = `<span>${item.label}</span><span class="ctx-key">${item.key}</span>`;
+      btn.addEventListener('click', () => {
+        closeContextMenu();
+        item.act();
+      });
+      menu.appendChild(btn);
+    }
+
+    menu.hidden = false;
+    // Keep on-screen.
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.min(x, window.innerWidth - rect.width - 8) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + 'px';
+  }
+
+  function closeContextMenu() {
+    document.getElementById('ctx-menu').hidden = true;
+  }
+
+  document.addEventListener('mousedown', (e) => {
+    const menu = document.getElementById('ctx-menu');
+    if (!menu.hidden && !menu.contains(e.target)) closeContextMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeContextMenu();
+  });
+
+  function copyText(text) {
+    navigator.clipboard.writeText(text).then(
+      () => setStatus('Copied'),
+      () => setStatus('Copy failed')
+    );
+  }
+
+  // ─── Tree keyboard navigation ───────────────────────────────────────────
+
+  function visibleTreeRows() {
+    return Array.from(document.querySelectorAll('#tree .tree-row:not(.tree-close-row)'));
+  }
+
+  function nodeForRow(row) {
+    return state.tree.nodesBySelector.get(row.dataset.selectorKey) || null;
+  }
+
+  document.getElementById('tree').addEventListener('keydown', async (e) => {
+    if (e.target.closest('.tree-edit-wrap')) return; // inline editor owns keys
+    const rows = visibleTreeRows();
+    if (!rows.length) return;
+    const selectedKey = state.selected ? selKey(state.selected) : null;
+    let idx = rows.findIndex((r) => r.dataset.selectorKey === selectedKey);
+
+    const selectRowAt = (i) => {
+      const row = rows[Math.max(0, Math.min(rows.length - 1, i))];
+      const node = nodeForRow(row);
+      if (node) {
+        selectNode(node);
+        row.scrollIntoView({ block: 'nearest' });
+      }
+    };
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        selectRowAt(idx < 0 ? 0 : idx + 1);
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        selectRowAt(idx < 0 ? 0 : idx - 1);
+        break;
+      case 'ArrowRight': {
+        e.preventDefault();
+        if (idx < 0) return;
+        const row = rows[idx];
+        const node = nodeForRow(row);
+        const toggle = row.querySelector('.tree-toggle');
+        if (node && toggle?.classList.contains('collapsed')) {
+          const wrap = row.closest('.tree-node');
+          const indent = row.querySelector('.tree-indent');
+          const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
+          await toggleNode(node, wrap, toggle, depth);
+        } else {
+          selectRowAt(idx + 1);
+        }
+        break;
+      }
+      case 'ArrowLeft': {
+        e.preventDefault();
+        if (idx < 0) return;
+        const row = rows[idx];
+        const node = nodeForRow(row);
+        const toggle = row.querySelector('.tree-toggle');
+        if (node && toggle?.classList.contains('expanded')) {
+          const wrap = row.closest('.tree-node');
+          const indent = row.querySelector('.tree-indent');
+          const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
+          await toggleNode(node, wrap, toggle, depth);
+        } else {
+          // Move to parent row.
+          const wrap = row.closest('.tree-node');
+          const parentWrap = wrap?.parentElement?.closest('.tree-node');
+          if (parentWrap) {
+            const parentRow = parentWrap.querySelector(':scope > .tree-row');
+            const parentNode = nodeForRow(parentRow);
+            if (parentNode) selectNode(parentNode);
+          }
+        }
+        break;
+      }
+      case 'Delete':
+      case 'Backspace':
+        e.preventDefault();
+        if (state.selected) deleteSelectedElement(state.selected);
+        break;
+      case 'h':
+      case 'H':
+        e.preventDefault();
+        if (state.selected) toggleHideElement(state.selected);
+        break;
+      case 'F2':
+      case 'Enter': {
+        e.preventDefault();
+        if (idx < 0) return;
+        const row = rows[idx];
+        const node = nodeForRow(row);
+        if (node) startInlineHtmlEdit(node, row);
+        break;
+      }
+    }
+  });
+
+  // ─── Selected element info ──────────────────────────────────────────────
 
   async function loadElementInfo() {
     if (!state.selected) {
@@ -546,6 +820,7 @@
       renderStyles();
       renderComputed();
       renderBox();
+      renderBreadcrumbs();
       return;
     }
     setStatus(state.selected.value);
@@ -554,6 +829,7 @@
     renderStyles();
     renderComputed();
     renderBox();
+    renderBreadcrumbs();
   }
 
   // ─── Styles tab ─────────────────────────────────────────────────────────
@@ -578,9 +854,8 @@
     const filter = (document.getElementById('style-filter').value || '').toLowerCase();
     const info = state.selectedInfo;
 
-    // Index every CSS change by (selector, property). When we render the
-    // owning rule we fold the change into its properties in-place, so
-    // toggling a checkbox doesn't spawn a duplicate row in the panel.
+    // Index CSS changes by (selector, property); fold each into the rule
+    // that owns it so checkbox toggles never spawn duplicate rows.
     const changesByKey = new Map();
     for (const c of state.changes) {
       if (c.property === '__html__' || c.property === '__remove__') continue;
@@ -620,8 +895,6 @@
 
     const rules = [];
 
-    // 1) element.style — inline page styles plus any edits on the selected
-    // element's own selector.
     const inlineSelector = state.selected.value;
     rules.push({
       kind: 'inline',
@@ -632,9 +905,6 @@
       targetSelector: inlineSelector,
     });
 
-    // 2) Author rules. Skip the rules we manufactured in our own override
-    // stylesheet — they're already accounted for by merging into the rule
-    // they target.
     for (const r of info.matched) {
       if (r.origin === 'desinspect') continue;
       rules.push({
@@ -648,10 +918,7 @@
       });
     }
 
-    // 3) Orphan edits — changes whose selector doesn't match any rendered
-    // rule above (rare; happens when the author rule was removed or the
-    // user used "+ new rule" to add a property under a selector that
-    // doesn't otherwise match this element). Group by selector.
+    // Orphan edits — selector doesn't match any rendered rule.
     const orphans = new Map();
     for (const [key, e] of changesByKey.entries()) {
       if (consumedKeys.has(key)) continue;
@@ -678,9 +945,7 @@
       });
     }
 
-    // Compute "overridden": walking from top, first occurrence of a name
-    // wins, later ones are struck through. Disabled properties don't win
-    // anything — they shouldn't mark lower-cascade siblings as overridden.
+    // Overridden: first (topmost) non-disabled occurrence of a name wins.
     const seen = new Set();
     for (const r of rules) {
       for (const p of r.properties) {
@@ -733,7 +998,6 @@
       body.appendChild(renderPropRow(p, rule));
     }
 
-    // Add-property row
     const add = document.createElement('div');
     add.className = 'prop-add';
     add.textContent = '+ add property';
@@ -768,7 +1032,6 @@
       row.appendChild(dot);
     }
 
-    // color swatch
     const swatch = makeColorSwatch(p.value);
     if (swatch) {
       swatch.addEventListener('click', (e) => {
@@ -805,6 +1068,12 @@
     return row;
   }
 
+  function selectorFor(rule) {
+    return rule.kind === 'inline'
+      ? state.selected
+      : { type: 'css', value: rule.targetSelector };
+  }
+
   function editPropName(span, p, rule) {
     const oldName = p.name;
     span.contentEditable = 'true';
@@ -821,8 +1090,7 @@
       span.removeEventListener('blur', commit);
       span.removeEventListener('keydown', onKey);
       if (newName === oldName || !newName) { span.textContent = oldName; return; }
-      // delete old, save new
-      saveStyleEdit(rule, oldName, '', /* delete */ true).then(() => {
+      saveStyleEdit(rule, oldName, '', true).then(() => {
         saveStyleEdit(rule, newName, p.value, false);
       });
     };
@@ -831,7 +1099,6 @@
       if (e.key === 'Tab') {
         e.preventDefault();
         span.blur();
-        // focus the value
         const valEl = span.parentElement.querySelector('.prop-value');
         if (valEl) editPropValue(valEl, p, rule);
       }
@@ -843,6 +1110,10 @@
 
   function editPropValue(span, p, rule) {
     const oldVal = p.value;
+    // Whether a change record existed before this edit session started —
+    // Escape must restore that exact state, not just the visual text.
+    const hadRecord = !!p.edited;
+    const priorDisabled = !!p.disabled;
     span.contentEditable = 'true';
     span.focus();
     const range = document.createRange();
@@ -851,29 +1122,58 @@
     sel.removeAllRanges();
     sel.addRange(range);
 
-    let committed = false;
-    const commit = () => {
-      if (committed) return;
-      committed = true;
+    let finished = false;
+    const cleanup = () => {
       span.contentEditable = 'false';
-      const newVal = (span.textContent || '').trim();
       span.removeEventListener('blur', commit);
       span.removeEventListener('keydown', onKey);
       span.removeEventListener('input', live);
+    };
+    const commit = () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      const newVal = (span.textContent || '').trim();
       if (newVal === oldVal) return;
       saveStyleEdit(rule, p.name, newVal, false);
     };
+    const cancel = async () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      span.textContent = oldVal;
+      // Live preview already persisted intermediate values — undo that.
+      if (hadRecord) {
+        await send('APPLY_STYLE', {
+          payload: {
+            selector: selectorFor(rule),
+            property: p.name,
+            value: oldVal,
+            disabled: priorDisabled,
+            elementLabel: state.selected?.value,
+          },
+        });
+      } else {
+        await send('REVERT_PROP', { selector: rule.targetSelector, property: p.name });
+      }
+      await loadChanges();
+      await loadElementInfo();
+    };
     const live = () => {
-      // live preview without persisting yet (debounced save happens server-side)
       const v = (span.textContent || '').trim();
-      send('APPLY_STYLE', { payload: {
-        selector: { type: 'css', value: rule.targetSelector },
-        property: p.name, value: v, elementLabel: state.selected?.value
-      }});
+      if (!v) return;
+      send('APPLY_STYLE', {
+        payload: {
+          selector: selectorFor(rule),
+          property: p.name,
+          value: v,
+          elementLabel: state.selected?.value,
+        },
+      });
     };
     const onKey = (e) => {
       if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
-      if (e.key === 'Escape') { span.textContent = oldVal; span.blur(); }
+      if (e.key === 'Escape') { e.preventDefault(); cancel(); }
     };
     span.addEventListener('blur', commit);
     span.addEventListener('keydown', onKey);
@@ -894,6 +1194,7 @@
     nameIn.placeholder = 'property';
     nameIn.spellcheck = false;
     nameIn.autocomplete = 'off';
+    nameIn.setAttribute('list', 'css-props');
     row.appendChild(nameIn);
 
     const colon = document.createElement('span');
@@ -941,7 +1242,6 @@
         cancel();
       }
     });
-    // Commit on blur if user clicks away after entering both fields
     const onBlur = () => {
       setTimeout(() => {
         if (committed) return;
@@ -954,18 +1254,63 @@
     valIn.addEventListener('blur', onBlur);
   }
 
+  /** "+ New rule": selector input first, then properties under it. */
+  function startNewRule() {
+    if (!state.selected) {
+      setStatus('Select an element first');
+      return;
+    }
+    const root = document.getElementById('styles');
+    const block = document.createElement('div');
+    block.className = 'style-rule';
+
+    const head = document.createElement('div');
+    head.className = 'rule-header';
+    const selIn = document.createElement('input');
+    selIn.className = 'new-rule-selector';
+    selIn.value = state.selected.value;
+    selIn.spellcheck = false;
+    head.appendChild(selIn);
+    block.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'rule-body';
+    const add = document.createElement('div');
+    add.className = 'prop-add';
+    add.textContent = '+ add property';
+    body.appendChild(add);
+    block.appendChild(body);
+
+    // New rule goes right under element.style (index 0).
+    const first = root.querySelector('.style-rule');
+    if (first && first.nextSibling) root.insertBefore(block, first.nextSibling);
+    else root.appendChild(block);
+
+    selIn.focus();
+    selIn.select();
+
+    const ruleRef = { kind: 'rule', targetSelector: selIn.value };
+    selIn.addEventListener('input', () => {
+      ruleRef.targetSelector = selIn.value.trim() || state.selected.value;
+    });
+    selIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        startAddProperty(add, ruleRef);
+      } else if (e.key === 'Escape') {
+        block.remove();
+      }
+    });
+    add.addEventListener('click', () => startAddProperty(add, ruleRef));
+  }
+
   async function saveStyleEdit(rule, property, value, isDelete) {
     if (!state.selected) return;
     if (isDelete) {
-      const id = changeIdFor(rule.targetSelector, property);
-      await send('REVERT_CHANGE', { id });
+      await send('REVERT_PROP', { selector: rule.targetSelector, property });
     } else {
-      const sel =
-        rule.kind === 'inline'
-          ? state.selected
-          : { type: 'css', value: rule.targetSelector };
       await send('APPLY_STYLE', {
-        payload: { selector: sel, property, value, elementLabel: state.selected.value },
+        payload: { selector: selectorFor(rule), property, value, elementLabel: state.selected.value },
       });
     }
     await loadElementInfo();
@@ -973,57 +1318,29 @@
   }
 
   /**
-   * Checkbox toggle on a property row. Three flavors:
-   *   - Unchecking anything → persist a `disabled` change. The override
-   *     stylesheet inserts `revert !important` so the property turns off.
-   *   - Re-checking a property that was originally in the author CSS
-   *     (`p.edited && !p._added`) → delete the change entirely so the
-   *     original cascade resumes.
-   *   - Re-checking a property we added ourselves → keep the change but
-   *     clear its disabled flag.
+   * Checkbox toggle. Unchecking persists a disabled change (revert
+   * !important). Re-checking an author property deletes the change so the
+   * cascade resumes; re-checking an added property clears its flag.
    */
   async function toggleProp(rule, p, disabled) {
     if (!state.selected) return;
-    const sel = rule.kind === 'inline'
-      ? state.selected
-      : { type: 'css', value: rule.targetSelector };
+    const sel = selectorFor(rule);
 
     if (!disabled) {
-      // Re-check.
       if (p.edited && !p._added && p.id) {
         await send('REVERT_CHANGE', { id: p.id });
       } else {
         await send('APPLY_STYLE', {
-          payload: {
-            selector: sel,
-            property: p.name,
-            value: p.value,
-            disabled: false,
-            elementLabel: state.selected.value,
-          },
+          payload: { selector: sel, property: p.name, value: p.value, disabled: false, elementLabel: state.selected.value },
         });
       }
     } else {
-      // Uncheck → persist disabled.
       await send('APPLY_STYLE', {
-        payload: {
-          selector: sel,
-          property: p.name,
-          value: p.value,
-          disabled: true,
-          elementLabel: state.selected.value,
-        },
+        payload: { selector: sel, property: p.name, value: p.value, disabled: true, elementLabel: state.selected.value },
       });
     }
     await loadElementInfo();
     await loadChanges();
-  }
-
-  function changeIdFor(selector, property) {
-    // Mirror PersistDB.normalizeUrl(location.href) — but we don't have it here.
-    // The content script will resolve; we instead read from state.changes.
-    const m = state.changes.find((c) => c.selector === selector && c.property === property);
-    return m?.id;
   }
 
   function makeColorSwatch(value) {
@@ -1037,23 +1354,17 @@
     return s;
   }
 
-  function openColorPicker(p, rule, swatch) {
+  function openColorPicker(p, rule) {
     const input = document.createElement('input');
     input.type = 'color';
     input.style.position = 'fixed';
     input.style.opacity = '0';
     document.body.appendChild(input);
-    const initial = parseColorToHex(p.value) || '#000000';
-    input.value = initial;
+    input.value = parseColorToHex(p.value) || '#000000';
     input.click();
     input.addEventListener('input', () => {
       send('APPLY_STYLE', {
-        payload: {
-          selector: rule.kind === 'inline' ? state.selected : { type: 'css', value: rule.targetSelector },
-          property: p.name,
-          value: input.value,
-          elementLabel: state.selected.value,
-        },
+        payload: { selector: selectorFor(rule), property: p.name, value: input.value, elementLabel: state.selected.value },
       });
     });
     input.addEventListener('change', () => {
@@ -1070,6 +1381,32 @@
     }
     return null;
   }
+
+  // ─── Force element state (:hov) ─────────────────────────────────────────
+
+  function syncHovUI() {
+    const row = document.getElementById('hov-row');
+    row.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+      cb.checked = state.forcedStates.includes(cb.dataset.state);
+    });
+    document.getElementById('btn-hov').classList.toggle('active', state.forcedStates.length > 0);
+  }
+
+  document.getElementById('btn-hov').addEventListener('click', () => {
+    const row = document.getElementById('hov-row');
+    row.hidden = !row.hidden;
+  });
+
+  document.getElementById('hov-row').addEventListener('change', async () => {
+    if (!state.selected) return;
+    const states = Array.from(
+      document.querySelectorAll('#hov-row input[type="checkbox"]:checked')
+    ).map((cb) => cb.dataset.state);
+    state.forcedStates = states;
+    await send('FORCE_STATE', { selector: state.selected, states });
+    syncHovUI();
+    await loadElementInfo();
+  });
 
   // ─── Computed tab ───────────────────────────────────────────────────────
 
@@ -1147,8 +1484,8 @@
     `;
   }
 
-  // Simple HTML pretty-printer. Uses the browser's parser, then walks the
-  // tree and emits indented markup. Stays self-contained — no js-beautify.
+  // ─── HTML pretty-printer ────────────────────────────────────────────────
+
   function prettyHtml(html, indent = '  ') {
     if (!html) return '';
     const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
@@ -1172,13 +1509,9 @@
       if (node.nodeType !== 1) return '';
       const tag = node.tagName.toLowerCase();
       const a = attrs(node);
-      if (VOID.has(tag)) {
-        return `${pad}<${tag}${a}>\n`;
-      }
+      if (VOID.has(tag)) return `${pad}<${tag}${a}>\n`;
       const children = Array.from(node.childNodes);
-      if (children.length === 0) {
-        return `${pad}<${tag}${a}></${tag}>\n`;
-      }
+      if (children.length === 0) return `${pad}<${tag}${a}></${tag}>\n`;
       if (
         children.length === 1 &&
         children[0].nodeType === 3 &&
@@ -1224,6 +1557,7 @@
         state.selected = { type: c.selectorType || 'css', value: c.selector };
         await send('SELECT', { selector: state.selected });
         await loadElementInfo();
+        await revealInTree(state.selected);
       });
       head.appendChild(sel);
 
@@ -1235,9 +1569,7 @@
       x.title = 'Revert this change';
       x.addEventListener('click', async () => {
         await send('REVERT_CHANGE', { id: c.id });
-        await loadChanges();
-        await refreshTreeRoot();
-        if (state.selected) await loadElementInfo();
+        await refreshAfterMutation();
       });
       actions.appendChild(x);
       head.appendChild(actions);
@@ -1248,7 +1580,7 @@
       if (c.property === '__html__') {
         body.innerHTML = `<span class="change-prop">html</span>: <span class="change-value">${truncate(escapeHtml(c.value || ''), 80)}</span>`;
       } else if (c.property === '__remove__') {
-        body.innerHTML = `<span class="change-prop">removed from DOM</span>`;
+        body.innerHTML = `<span class="change-prop">deleted:</span> <span class="change-value">${truncate(escapeHtml(c.originalValue || ''), 60)}</span>`;
       } else {
         body.innerHTML = `<span class="change-prop">${escapeHtml(c.property)}</span>: <span class="change-value">${escapeHtml(c.value || '')}</span>` + (c.disabled ? ' <span class="muted">(disabled)</span>' : '');
       }
@@ -1286,11 +1618,9 @@
       const restore = document.createElement('button');
       restore.textContent = 'Restore';
       restore.addEventListener('click', async () => {
-        if (!confirm(`Restore "${s.name}"? This will replace current edits.`)) return;
+        if (!confirm(`Restore "${s.name}"? This will replace current edits (undoable with ⌘Z).`)) return;
         await send('RESTORE_SNAPSHOT', { id: s.id });
-        await loadChanges();
-        await refreshTreeRoot();
-        if (state.selected) await loadElementInfo();
+        await refreshAfterMutation();
       });
       const del = document.createElement('button');
       del.textContent = 'Delete';
@@ -1307,6 +1637,32 @@
     }
   }
 
+  // ─── Undo / redo ────────────────────────────────────────────────────────
+
+  async function doUndo() {
+    const r = await send('UNDO');
+    if (r?.done) await refreshAfterMutation();
+  }
+
+  async function doRedo() {
+    const r = await send('REDO');
+    if (r?.done) await refreshAfterMutation();
+  }
+
+  document.getElementById('btn-undo').addEventListener('click', doUndo);
+  document.getElementById('btn-redo').addEventListener('click', doRedo);
+
+  document.addEventListener('keydown', (e) => {
+    // Don't hijack ⌘Z while typing in inputs/editables.
+    const t = e.target;
+    const typing =
+      t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+    if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z' || typing) return;
+    e.preventDefault();
+    if (e.shiftKey) doRedo();
+    else doUndo();
+  });
+
   // ─── Toolbar / tab wiring ───────────────────────────────────────────────
 
   document.getElementById('btn-pick').addEventListener('click', async () => {
@@ -1320,11 +1676,9 @@
   });
 
   document.getElementById('btn-clear').addEventListener('click', async () => {
-    if (!confirm('Revert ALL edits on this page?')) return;
+    if (!confirm('Revert ALL edits on this page? (undoable with ⌘Z)')) return;
     await send('REVERT_ALL');
-    await loadChanges();
-    await refreshTreeRoot();
-    if (state.selected) await loadElementInfo();
+    await refreshAfterMutation();
   });
 
   document.getElementById('btn-snapshot').addEventListener('click', async () => {
@@ -1338,6 +1692,8 @@
     inp.value = '';
     await loadSnapshots();
   });
+
+  document.getElementById('btn-add-rule').addEventListener('click', startNewRule);
 
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -1401,6 +1757,14 @@
   }
 
   // ─── Boot ───────────────────────────────────────────────────────────────
+
+  // Populate CSS property autocomplete.
+  const dl = document.getElementById('css-props');
+  for (const prop of CSS_PROPS) {
+    const opt = document.createElement('option');
+    opt.value = prop;
+    dl.appendChild(opt);
+  }
 
   initFromTab();
 })();
