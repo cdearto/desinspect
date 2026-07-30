@@ -1,14 +1,14 @@
 /**
  * DesInspect — Selector generator + resolver.
  *
- * Produces a string (CSS first, falls back to XPath) that uniquely
- * identifies an element. Stable enough to survive a page refresh and
- * common SPA re-renders.
- *
- * The selector is returned as { type: 'css' | 'xpath', value: string }.
+ * Produces { type: 'css' | 'xpath', value } identifying an element, stable
+ * enough to survive refresh and common SPA re-renders. Every generated
+ * selector is validated to resolve back to the exact element before being
+ * returned; on failure we fall through to the next strategy.
  */
 
 const SelectorEngine = (() => {
+  const HTML_NS = 'http://www.w3.org/1999/xhtml';
   const VOLATILE_CLASS_RE = /^(css-|sc-|jsx-|ng-|_|tw-|chakra-|mui-|desinspect-)/i;
   const VOLATILE_ID_RE = /^(ember|react|radix|headlessui|sn|__|sb-)/i;
 
@@ -24,27 +24,45 @@ const SelectorEngine = (() => {
     return CSS.escape ? CSS.escape(s) : s.replace(/(["\\#.:>+~()[\]^$|*=,])/g, '\\$1');
   }
 
-  function elementSegment(el) {
-    const tag = el.tagName.toLowerCase();
-    if (el.id && !isVolatileId(el.id)) return `#${escape(el.id)}`;
+  /**
+   * Tag name for CSS: lowercase for HTML-namespace elements, exact case for
+   * SVG/MathML (type selectors match case-sensitively outside HTML).
+   */
+  function cssTag(el) {
+    return el.namespaceURI === HTML_NS ? el.tagName.toLowerCase() : el.localName;
+  }
 
-    const classes = Array.from(el.classList)
+  function usableId(el) {
+    return el.id && !isVolatileId(el.id) &&
+      document.querySelectorAll(`#${escape(el.id)}`).length === 1
+      ? el.id
+      : null;
+  }
+
+  function elementSegment(el) {
+    const tag = cssTag(el);
+    const id = usableId(el);
+    if (id) return `#${escape(id)}`;
+
+    const classes = Array.from(el.classList || [])
       .filter((c) => !isVolatileClass(c))
       .slice(0, 2);
-    let seg = tag;
+    let seg = escape(tag) === tag ? tag : escape(tag);
     if (classes.length) seg += '.' + classes.map(escape).join('.');
 
-    // disambiguate among siblings
     const parent = el.parentElement;
     if (parent) {
-      const siblings = Array.from(parent.children).filter((c) => {
-        if (c.tagName.toLowerCase() !== tag) return false;
+      const sameSeg = Array.from(parent.children).filter((c) => {
+        if (cssTag(c) !== tag) return false;
         if (!classes.length) return true;
         return classes.every((cls) => c.classList.contains(cls));
       });
-      if (siblings.length > 1) {
-        const idx = siblings.indexOf(el) + 1;
-        seg += `:nth-of-type(${Array.from(parent.children).indexOf(el) + 1})`;
+      if (sameSeg.length > 1) {
+        // :nth-of-type counts same-tag siblings only — index among those,
+        // not among all children.
+        const sameTag = Array.from(parent.children).filter((c) => cssTag(c) === tag);
+        const idx = sameTag.indexOf(el) + 1;
+        seg = tag + `:nth-of-type(${idx})`;
       }
     }
     return seg;
@@ -54,75 +72,85 @@ const SelectorEngine = (() => {
     if (!(el instanceof Element)) return null;
     if (el === document.documentElement) return 'html';
     if (el === document.body) return 'body';
-    if (el.id && !isVolatileId(el.id)) return `#${escape(el.id)}`;
+    const id = usableId(el);
+    if (id) return `#${escape(id)}`;
 
     const parts = [];
     let cur = el;
     while (cur && cur !== document.documentElement && parts.length < 8) {
-      const seg = elementSegment(cur);
-      parts.unshift(seg);
-      // Stop early if we have a unique anchor
-      if (cur.id && !isVolatileId(cur.id)) break;
+      parts.unshift(elementSegment(cur));
+      if (usableId(cur)) break;
       cur = cur.parentElement;
     }
     return parts.join(' > ');
   }
 
+  /**
+   * Positional XPath using local-name() so SVG/MathML elements resolve
+   * (unprefixed name tests never match non-HTML namespaces in Chrome).
+   */
   function generateXPath(el) {
     if (!(el instanceof Element)) return null;
-    if (el.id && !isVolatileId(el.id)) return `//*[@id="${el.id}"]`;
     const parts = [];
     let cur = el;
     while (cur && cur.nodeType === 1) {
       let idx = 1;
       let sib = cur.previousElementSibling;
       while (sib) {
-        if (sib.tagName === cur.tagName) idx++;
+        if (sib.localName === cur.localName) idx++;
         sib = sib.previousElementSibling;
       }
-      parts.unshift(`${cur.tagName.toLowerCase()}[${idx}]`);
+      parts.unshift(`*[local-name()='${cur.localName}'][${idx}]`);
       cur = cur.parentElement;
     }
     return '/' + parts.join('/');
   }
 
+  function resolveCss(selector) {
+    try {
+      const matches = document.querySelectorAll(selector);
+      return matches.length === 1 ? matches[0] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function resolveXPath(xpath) {
+    try {
+      const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+      return r.singleNodeValue;
+    } catch {
+      return null;
+    }
+  }
+
   /**
-   * Generate the best selector for an element.
-   * Tries CSS, validates uniqueness, falls back to XPath.
+   * Generate the best selector: CSS validated for unique resolution to `el`,
+   * else positional XPath validated the same way.
    */
   function generate(el) {
     const css = generateCss(el);
-    if (css) {
-      try {
-        const matches = document.querySelectorAll(css);
-        if (matches.length === 1 && matches[0] === el) {
-          return { type: 'css', value: css };
-        }
-      } catch {
-        /* invalid selector, fall through */
-      }
+    if (css && resolveCss(css) === el) {
+      return { type: 'css', value: css };
     }
     const xp = generateXPath(el);
-    return { type: 'xpath', value: xp };
+    if (xp && resolveXPath(xp) === el) {
+      return { type: 'xpath', value: xp };
+    }
+    // Last resort: return the CSS anyway (may resolve after re-render).
+    return css ? { type: 'css', value: css } : { type: 'xpath', value: xp };
   }
 
   function find(sel) {
     if (!sel || !sel.value) return null;
-    try {
-      if (sel.type === 'css') return document.querySelector(sel.value);
-      if (sel.type === 'xpath') {
-        const r = document.evaluate(
-          sel.value,
-          document,
-          null,
-          XPathResult.FIRST_ORDERED_NODE_TYPE,
-          null
-        );
-        return r.singleNodeValue;
+    if (sel.type === 'css') {
+      try {
+        return document.querySelector(sel.value);
+      } catch {
+        return null;
       }
-    } catch {
-      return null;
     }
+    if (sel.type === 'xpath') return resolveXPath(sel.value);
     return null;
   }
 

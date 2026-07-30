@@ -23,7 +23,12 @@
     activeTab: 'styles',
     forcedStates: [],           // active :hov forced states
     ancestors: [],              // breadcrumb chain for current selection
+    tabId: null,                // the inspected tab — URL_CHANGED for other tabs is noise
   };
+
+  let _infoToken = 0;           // discards stale GET_ELEMENT_INFO responses
+  let _reinitTimer = null;      // de-dupes double URL_CHANGED (onCommitted + onHistoryStateUpdated)
+  const _childLoads = new Map(); // selectorKey → pending children fetch (revealInTree awaits these)
 
   const CSS_PROPS = [
     'align-content','align-items','align-self','animation','appearance','aspect-ratio',
@@ -97,9 +102,29 @@
         refreshAfterMutation();
         break;
       case 'URL_CHANGED':
-        setTimeout(initFromTab, 200);
+        // Only react to the tab we're inspecting — the SW broadcasts for
+        // every tab, and a pinned tab auto-refreshing shouldn't wipe the
+        // panel. onCommitted + onHistoryStateUpdated also double-fire for
+        // one navigation, so coalesce.
+        if (state.tabId != null && msg.tabId != null && msg.tabId !== state.tabId) break;
+        clearTimeout(_reinitTimer);
+        _reinitTimer = setTimeout(initFromTab, 250);
+        break;
+      case 'REVERT_FAILED':
+        setStatus(msg.data?.reason || 'Revert failed — change kept.');
+        loadChanges();
         break;
     }
+  });
+
+  // Track which tab the panel is inspecting; re-init when the user switches.
+  chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+    if (tab?.id != null) state.tabId = tab.id;
+  }).catch(() => {});
+  chrome.tabs.onActivated?.addListener((info) => {
+    state.tabId = info.tabId;
+    clearTimeout(_reinitTimer);
+    _reinitTimer = setTimeout(initFromTab, 250);
   });
 
   function setStatus(text) {
@@ -271,7 +296,11 @@
       if (Array.isArray(cached)) {
         for (const c of cached) childContainer.appendChild(renderTreeNode(c, depth + 1));
       } else {
-        send('GET_TREE_CHILDREN', { selector: node.selector }).then((r) => {
+        // Track the pending fetch so revealInTree can await it instead of
+        // walking past a not-yet-rendered subtree.
+        const load = send('GET_TREE_CHILDREN', { selector: node.selector }).then((r) => {
+          _childLoads.delete(key);
+          if (!state.tree.expanded.has(key)) return; // collapsed meanwhile
           const children = r?.nodes || [];
           state.tree.expanded.set(key, children);
           childContainer.innerHTML = '';
@@ -279,6 +308,7 @@
           annotateTreeWithChanges();
           highlightTreeSelection();
         });
+        _childLoads.set(key, load);
       }
       const closingRow = document.createElement('div');
       closingRow.className = 'tree-row tree-close-row';
@@ -337,26 +367,34 @@
       cc.className = 'tree-children';
       wrap.appendChild(cc);
 
-      const r = await send('GET_TREE_CHILDREN', { selector: node.selector });
-      const children = r?.nodes || [];
-      state.tree.expanded.set(key, children);
-      cc.innerHTML = '';
-      for (const c of children) cc.appendChild(renderTreeNode(c, depth + 1));
+      const load = (async () => {
+        const r = await send('GET_TREE_CHILDREN', { selector: node.selector });
+        // Bail if the user collapsed the node while the fetch was in
+        // flight — applying anyway would resurrect it as expanded and
+        // leave a stray closing-tag row.
+        if (!state.tree.expanded.has(key) || !toggle.classList.contains('expanded')) return;
+        const children = r?.nodes || [];
+        state.tree.expanded.set(key, children);
+        cc.innerHTML = '';
+        for (const c of children) cc.appendChild(renderTreeNode(c, depth + 1));
 
-      const closingRow = document.createElement('div');
-      closingRow.className = 'tree-row tree-close-row';
-      const ind = document.createElement('span');
-      ind.className = 'tree-indent';
-      ind.style.width = depth * 12 + 'px';
-      const sp = document.createElement('span');
-      sp.className = 'tree-toggle';
-      closingRow.appendChild(ind);
-      closingRow.appendChild(sp);
-      closingRow.appendChild(renderCloseTag(node));
-      wrap.appendChild(closingRow);
+        const closingRow = document.createElement('div');
+        closingRow.className = 'tree-row tree-close-row';
+        const ind = document.createElement('span');
+        ind.className = 'tree-indent';
+        ind.style.width = depth * 12 + 'px';
+        const sp = document.createElement('span');
+        sp.className = 'tree-toggle';
+        closingRow.appendChild(ind);
+        closingRow.appendChild(sp);
+        closingRow.appendChild(renderCloseTag(node));
+        wrap.appendChild(closingRow);
 
-      annotateTreeWithChanges();
-      highlightTreeSelection();
+        annotateTreeWithChanges();
+        highlightTreeSelection();
+      })().finally(() => _childLoads.delete(key));
+      _childLoads.set(key, load);
+      await load;
     }
   }
 
@@ -442,7 +480,7 @@
       row.classList.remove('editing');
       row.innerHTML = original;
       if (newHtml.trim() === pretty.trim() || newHtml.trim() === raw.trim()) return;
-      await send('APPLY_HTML', {
+      const r = await send('APPLY_HTML', {
         payload: {
           selector: node.selector,
           value: newHtml,
@@ -450,6 +488,11 @@
           elementLabel: node.selector.value,
         },
       });
+      // The replacement element may have a different tag/id/class — adopt
+      // the fresh selector so selection/highlight/styles keep working.
+      if (r?.newSelector && state.selected && selKey(state.selected) === selKey(node.selector)) {
+        state.selected = r.newSelector;
+      }
       await refreshAfterMutation();
       setStatus('HTML applied');
     };
@@ -515,11 +558,20 @@
 
   async function expandTreeNode(node) {
     const key = selKey(node.selector);
+    // If this node's children are being fetched (e.g. renderTree after cache
+    // invalidation), wait — otherwise the reveal walk stops mid-way because
+    // the next ancestor's row isn't in the DOM yet.
+    const pending = _childLoads.get(key);
+    if (pending) await pending;
     const wrap = findTreeNodeWrap(key);
     if (!wrap) return false;
     const toggle = wrap.querySelector(':scope > .tree-row > .tree-toggle');
     if (!toggle || !toggle.classList.contains('has-children')) return false;
-    if (toggle.classList.contains('expanded')) return true;
+    if (toggle.classList.contains('expanded')) {
+      const stillPending = _childLoads.get(key);
+      if (stillPending) await stillPending;
+      return true;
+    }
     const indent = wrap.querySelector(':scope > .tree-row > .tree-indent');
     const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
     await toggleNode(node, wrap, toggle, depth);
@@ -824,7 +876,14 @@
       return;
     }
     setStatus(state.selected.value);
+    // Token guard: GET_ELEMENT_INFO latency varies wildly (cross-origin CSS
+    // fetch vs instant null). A stale slow response must not clobber the
+    // info for a newer selection.
+    const token = ++_infoToken;
+    const requestedKey = selKey(state.selected);
     const info = await send('GET_ELEMENT_INFO', { selector: state.selected });
+    if (token !== _infoToken) return;
+    if (!state.selected || selKey(state.selected) !== requestedKey) return;
     state.selectedInfo = info;
     renderStyles();
     renderComputed();
@@ -863,10 +922,11 @@
     }
     const consumedKeys = new Set();
 
-    function mergeChangesIntoProps(originalProps, selector) {
+    function mergeChangesIntoProps(originalProps, selector, { skipConsumed = false } = {}) {
       const merged = originalProps.map((p) => ({ ...p }));
       for (const [key, e] of changesByKey.entries()) {
         if (e.selector !== selector) continue;
+        if (skipConsumed && consumedKeys.has(key)) continue;
         const idx = merged.findIndex((p) => p.name === e.property);
         if (idx >= 0) {
           merged[idx] = {
@@ -893,21 +953,14 @@
       return merged;
     }
 
-    const rules = [];
-
-    const inlineSelector = state.selected.value;
-    rules.push({
-      kind: 'inline',
-      selector: 'element.style',
-      source: '',
-      properties: mergeChangesIntoProps(info.inline.properties, inlineSelector),
-      editable: true,
-      targetSelector: inlineSelector,
-    });
-
+    // Author rules consume their changes FIRST so a change made on an author
+    // rule whose selector happens to equal the element's own generated
+    // selector (e.g. '#hero') doesn't also appear as a phantom row under
+    // element.style.
+    const authorRules = [];
     for (const r of info.matched) {
       if (r.origin === 'desinspect') continue;
-      rules.push({
+      authorRules.push({
         kind: 'rule',
         selector: r.selector,
         pseudo: r.pseudo || null,
@@ -917,6 +970,19 @@
         targetSelector: r.selector,
       });
     }
+
+    const inlineSelector = state.selected.value;
+    const rules = [
+      {
+        kind: 'inline',
+        selector: 'element.style',
+        source: '',
+        properties: mergeChangesIntoProps(info.inline.properties, inlineSelector, { skipConsumed: true }),
+        editable: true,
+        targetSelector: inlineSelector,
+      },
+      ...authorRules,
+    ];
 
     // Orphan edits — selector doesn't match any rendered rule.
     const orphans = new Map();
@@ -1084,15 +1150,23 @@
     sel.removeAllRanges();
     sel.addRange(range);
 
-    const commit = () => {
+    const commit = async () => {
       span.contentEditable = 'false';
       const newName = (span.textContent || '').trim().toLowerCase();
       span.removeEventListener('blur', commit);
       span.removeEventListener('keydown', onKey);
       if (newName === oldName || !newName) { span.textContent = oldName; return; }
-      saveStyleEdit(rule, oldName, '', true).then(() => {
-        saveStyleEdit(rule, newName, p.value, false);
-      });
+      if (p.edited) {
+        // Our own change record — genuinely delete the old one.
+        await send('REVERT_PROP', { selector: rule.targetSelector, property: oldName });
+      } else {
+        // Author CSS can't be deleted; renaming means "turn the old
+        // declaration off, add the new one" — persist a disabled override.
+        await send('APPLY_STYLE', {
+          payload: { selector: selectorFor(rule), property: oldName, value: p.value, disabled: true, elementLabel: state.selected?.value },
+        });
+      }
+      await saveStyleEdit(rule, newName, p.value, false);
     };
     const onKey = (e) => {
       if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
@@ -1174,10 +1248,41 @@
     const onKey = (e) => {
       if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
       if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      // Chrome-style numeric stepping: ↑/↓ ±1, ⇧ ±10, ⌥ ±0.1.
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        const stepped = stepNumericValue(
+          span.textContent || '',
+          (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 10 : e.altKey ? 0.1 : 1)
+        );
+        if (stepped !== null) {
+          e.preventDefault();
+          span.textContent = stepped;
+          // caret to end
+          const r2 = document.createRange();
+          r2.selectNodeContents(span);
+          r2.collapse(false);
+          const s2 = window.getSelection();
+          s2.removeAllRanges();
+          s2.addRange(r2);
+          live();
+        }
+      }
     };
     span.addEventListener('blur', commit);
     span.addEventListener('keydown', onKey);
     span.addEventListener('input', live);
+  }
+
+  /**
+   * Step the first number in a CSS value by delta, preserving the unit.
+   * Returns null when the value has no number (arrow keys then do nothing).
+   */
+  function stepNumericValue(value, delta) {
+    const m = value.match(/-?\d*\.?\d+/);
+    if (!m) return null;
+    const num = parseFloat(m[0]);
+    const stepped = Math.round((num + delta) * 100) / 100;
+    return value.slice(0, m.index) + String(stepped) + value.slice(m.index + m[0].length);
   }
 
   function startAddProperty(addRow, rule) {

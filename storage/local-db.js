@@ -15,6 +15,7 @@ const PersistDB = (() => {
   const STORE_SNAPSHOTS = 'snapshots';
 
   let _dbPromise = null;
+  let _dbInstance = null; // cached handle for synchronous transactions (unload flush)
 
   function open() {
     if (_dbPromise) return _dbPromise;
@@ -31,10 +32,18 @@ const PersistDB = (() => {
           s.createIndex('byUrl', 'urlPattern', { unique: false });
         }
       };
-      req.onsuccess = (e) => resolve(e.target.result);
+      req.onsuccess = (e) => {
+        _dbInstance = e.target.result;
+        resolve(_dbInstance);
+      };
       req.onerror = (e) => reject(e.target.error);
     });
     return _dbPromise;
+  }
+
+  /** Cached DB handle, or null if open() hasn't resolved yet. */
+  function dbSync() {
+    return _dbInstance;
   }
 
   function normalizeUrl(url) {
@@ -75,7 +84,10 @@ const PersistDB = (() => {
    */
   async function putChange(c) {
     const id = c.id || `${c.urlPattern}::${c.selector}::${c.property}`;
-    const record = { ...c, id, timestamp: Date.now() };
+    // Preserve the caller's timestamp — undo/redo and snapshot restore write
+    // historical records, and structural replay order depends on creation
+    // time. Only stamp when the caller didn't.
+    const record = { ...c, id, timestamp: c.timestamp ?? Date.now() };
     const store = await tx(STORE_CHANGES, 'readwrite');
     await wrap(store.put(record));
     return record;
@@ -135,6 +147,7 @@ const PersistDB = (() => {
 
   return {
     open,
+    dbSync,
     normalizeUrl,
     putChange,
     deleteChange,

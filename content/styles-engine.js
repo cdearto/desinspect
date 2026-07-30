@@ -31,15 +31,33 @@ const StylesEngine = (() => {
 
   function parseProps(cssText) {
     // Split a rule body into individual { prop, value, important } tuples.
+    // Tracks quote state so `content: "a;b"` and quoted parens don't corrupt
+    // the split; parens count only outside strings (url(data:…;base64) safe).
     const out = [];
     if (!cssText) return out;
     const body = cssText.replace(/^[^{]*\{/, '').replace(/\}\s*$/, '');
-    // naive split on ; that isn't in parens
     let depth = 0;
+    let quote = null; // active quote char or null
     let cur = '';
-    for (const ch of body) {
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (quote) {
+        cur += ch;
+        if (ch === '\\') {
+          // keep escaped char verbatim, don't let it terminate the string
+          if (i + 1 < body.length) { cur += body[++i]; }
+        } else if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        cur += ch;
+        continue;
+      }
       if (ch === '(') depth++;
-      else if (ch === ')') depth--;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
       if (ch === ';' && depth === 0) {
         if (cur.trim()) out.push(cur.trim());
         cur = '';
@@ -83,7 +101,12 @@ const StylesEngine = (() => {
     'valid', 'invalid', 'in-range', 'out-of-range', 'required', 'optional',
     'user-invalid', 'target', 'scope', 'host', 'fullscreen',
   ];
-  const DYNAMIC_RE = new RegExp(`:(?:${DYNAMIC_PSEUDOS.join('|')})(?:\\([^)]*\\))?`, 'gi');
+  // Longest-first + boundary guard so ':focus' can't half-match
+  // ':focus-visible' and leave '-visible' glued to the selector.
+  const DYNAMIC_RE = new RegExp(
+    `:(?:${[...DYNAMIC_PSEUDOS].sort((a, b) => b.length - a.length).join('|')})(?![\\w-])(?:\\([^)]*\\))?`,
+    'gi'
+  );
   const PSEUDO_ELEMENT_RE = /::[a-zA-Z-]+(?:\([^)]*\))?/g;
 
   function stripDynamicPseudos(selector) {
@@ -168,22 +191,31 @@ const StylesEngine = (() => {
     return fetchViaSW(href);
   }
 
+  const FAIL_RETRY_MS = 15000;
+  const _xoSheetFailAt = new Map(); // href → last failure timestamp
+
   async function fetchAsStylesheet(href) {
-    if (_xoSheetCache.has(href)) return _xoSheetCache.get(href);
+    const cached = _xoSheetCache.get(href);
+    if (cached) return cached;
+    // Failures are retried after a cooldown instead of being cached forever —
+    // a transient CDN blip shouldn't hide a stylesheet for the page lifetime.
+    const failedAt = _xoSheetFailAt.get(href);
+    if (failedAt && Date.now() - failedAt < FAIL_RETRY_MS) return null;
     if (_xoSheetPending.has(href)) return _xoSheetPending.get(href);
     const p = (async () => {
-      const text = await fetchStylesheetText(href);
-      if (!text) {
-        _xoSheetCache.set(href, null);
-        return null;
-      }
       try {
+        const text = await fetchStylesheetText(href);
+        if (!text) {
+          _xoSheetFailAt.set(href, Date.now());
+          return null;
+        }
         const synth = new CSSStyleSheet();
         synth.replaceSync(text);
         _xoSheetCache.set(href, synth);
+        _xoSheetFailAt.delete(href);
         return synth;
       } catch {
-        _xoSheetCache.set(href, null);
+        _xoSheetFailAt.set(href, Date.now());
         return null;
       } finally {
         _xoSheetPending.delete(href);
@@ -193,42 +225,75 @@ const StylesEngine = (() => {
     return p;
   }
 
+  function sheetActive(sheet) {
+    try {
+      if (sheet.disabled) return false;
+      const media = sheet.media?.mediaText;
+      if (media && !window.matchMedia(media).matches) return false;
+    } catch {}
+    return true;
+  }
+
   async function matchedRules(el) {
     const out = [];
-    const sheets = Array.from(document.styleSheets);
+    const sheets = [
+      ...Array.from(document.styleSheets),
+      ...Array.from(document.adoptedStyleSheets || []),
+    ];
 
-    // First pass: same-origin sheets (sync).
+    // First pass: readable sheets (sync). Cross-origin ones queue for fetch;
+    // @import rules inside readable sheets can queue more.
     const xoTargets = [];
     for (const sheet of sheets) {
+      if (!sheetActive(sheet)) continue;
       const rules = safeRules(sheet);
       const src = sheetSource(sheet);
       if (rules) {
-        walkRules(out, rules, el, sheet, src, '');
+        walkRules(out, rules, el, sheet, src, '', xoTargets);
       } else if (sheet.href) {
         xoTargets.push({ sheet, src });
       }
     }
 
-    // Second pass: cross-origin sheets, fetched in parallel.
-    if (xoTargets.length) {
-      const fetched = await Promise.all(
-        xoTargets.map(({ sheet }) => fetchAsStylesheet(sheet.href))
-      );
-      for (let i = 0; i < xoTargets.length; i++) {
+    // Second pass: fetch queued sheets in parallel. Their bodies may contain
+    // further @imports — synthesized sheets have no .styleSheet children, so
+    // one more walk pass with the same queue drains nested levels.
+    let queue = xoTargets;
+    let guard = 0;
+    while (queue.length && guard++ < 3) {
+      const next = [];
+      const fetched = await Promise.all(queue.map(({ sheet }) => fetchAsStylesheet(sheet.href || sheet.__href)));
+      for (let i = 0; i < queue.length; i++) {
         const synth = fetched[i];
         if (!synth) continue;
-        const { sheet, src } = xoTargets[i];
-        walkRules(out, synth.cssRules, el, sheet, src + ' (xo)', '');
+        const { sheet, src } = queue[i];
+        walkRules(out, synth.cssRules, el, sheet, src + ' (xo)', '', next);
       }
+      queue = next;
     }
     return out;
   }
 
-  function walkRules(out, rules, el, sheet, src, mediaSuffix) {
+  function walkRules(out, rules, el, sheet, src, mediaSuffix, xoTargets) {
     for (const rule of Array.from(rules)) {
       // CSSStyleRule
       if (rule.type === 1 || rule.constructor.name === 'CSSStyleRule') {
         pushStyleRule(out, rule, el, sheet, src, mediaSuffix);
+        continue;
+      }
+      // CSSImportRule — child sheet lives on rule.styleSheet, not .cssRules
+      if (rule.type === 3 || rule.constructor.name === 'CSSImportRule') {
+        let media = null;
+        try { media = rule.media?.mediaText; } catch {}
+        if (media && !window.matchMedia(media).matches) continue;
+        const imported = rule.styleSheet;
+        if (!imported) continue;
+        const importedRules = safeRules(imported);
+        if (importedRules) {
+          walkRules(out, importedRules, el, imported, sheetSource(imported), mediaSuffix, xoTargets);
+        } else if (imported.href && xoTargets) {
+          xoTargets.push({ sheet: imported, src: sheetSource(imported) });
+        }
         continue;
       }
       // CSSMediaRule — recurse if it currently applies
@@ -236,7 +301,7 @@ const StylesEngine = (() => {
         let media = null;
         try { media = rule.media?.mediaText; } catch {}
         if (media && !window.matchMedia(media).matches) continue;
-        walkRules(out, rule.cssRules || [], el, sheet, src, media ? `@media ${media}` : mediaSuffix);
+        walkRules(out, rule.cssRules || [], el, sheet, src, media ? `@media ${media}` : mediaSuffix, xoTargets);
         continue;
       }
       // CSSSupportsRule — recurse if supported

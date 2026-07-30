@@ -200,8 +200,8 @@
     });
   }
 
-  function applyHtmlEdit({ selector, value, originalValue, elementLabel }) {
-    return Persistence.saveChange({
+  async function applyHtmlEdit({ selector, value, originalValue, elementLabel }) {
+    const record = await Persistence.saveChange({
       selector: selector.value,
       selectorType: selector.type,
       property: '__html__',
@@ -210,6 +210,22 @@
       elementTag: _selected?.tagName?.toLowerCase() || null,
       elementLabel: elementLabel || null,
     });
+    // The replacement element may have a different tag/id/class, so the old
+    // selector can be stale. Hand the panel a fresh one, and re-point the
+    // page-side selection if it was the node that just got replaced.
+    const live = Persistence.getLiveElement(record.id);
+    let newSelector = null;
+    if (live) {
+      newSelector = SelectorEngine.generate(live);
+      if (_selected && !_selected.isConnected) {
+        _selected = live;
+        _selectedSelector = newSelector;
+        Overlay.showSelected(live);
+      }
+    } else if (_selected && !_selected.isConnected) {
+      selectElement(null);
+    }
+    return { record, newSelector };
   }
 
   /**
@@ -335,9 +351,15 @@
       case 'REVERT_ALL':
         await Persistence.clearAll();
         return { ok: true };
+      case 'URL_CHANGED':
+        Persistence.handleNavigation();
+        return { ok: true };
       case 'GET_CHANGES':
         return { changes: Persistence.getCurrentChanges() };
       case 'CREATE_SNAPSHOT':
+        // Flush debounced CSS writes first — a snapshot taken from raw IDB
+        // would silently miss the newest keystrokes.
+        await Persistence.flushNow();
         return { id: await PersistDB.createSnapshot(location.href, msg.name) };
       case 'GET_SNAPSHOTS':
         return { snapshots: await PersistDB.getSnapshotsForUrl(location.href) };

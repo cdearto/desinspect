@@ -60,17 +60,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return false;
 });
 
-// Notify the sidepanel on SPA navigation so it can refresh its view.
-chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+// Notify BOTH sides on navigation. chrome.runtime.sendMessage reaches
+// extension pages (the sidepanel) but never content scripts — those need
+// chrome.tabs.sendMessage. The content script relies on this push (plus its
+// own URL poll) because history monkey-patching doesn't work from the
+// isolated world.
+function broadcastUrlChange(details) {
   if (details.frameId !== 0) return;
   chrome.runtime
     .sendMessage({ type: 'URL_CHANGED', url: details.url, tabId: details.tabId })
     .catch(() => {});
-});
+  chrome.tabs
+    .sendMessage(details.tabId, { type: 'URL_CHANGED', url: details.url })
+    .catch(() => {});
+}
 
-chrome.webNavigation.onCommitted.addListener((details) => {
-  if (details.frameId !== 0) return;
-  chrome.runtime
-    .sendMessage({ type: 'URL_CHANGED', url: details.url, tabId: details.tabId })
-    .catch(() => {});
-});
+chrome.webNavigation.onHistoryStateUpdated.addListener(broadcastUrlChange);
+chrome.webNavigation.onCommitted.addListener(broadcastUrlChange);
