@@ -63,7 +63,11 @@
     return r.response?.data || null;
   }
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender) => {
+    // Content scripts in EVERY tab push messages (CHANGES_LOADED on load,
+    // UNDO_STATE on SPA nav, …). Only the inspected tab's pushes matter —
+    // a background tab reloading must not clobber this panel's state.
+    if (sender?.tab && state.tabId != null && sender.tab.id !== state.tabId) return;
     switch (msg?.type) {
       case 'PICKER_STATE':
         state.pickerActive = msg.data.active;
@@ -82,6 +86,19 @@
           } else {
             revealInTree(state.selected);
           }
+        } else {
+          // Page-side deselection (e.g. selection was inside a replaced
+          // subtree) — reflect it instead of showing stale panes.
+          state.selected = null;
+          state.selectedInfo = null;
+          state.forcedStates = [];
+          syncHovUI();
+          renderStyles();
+          renderComputed();
+          renderBox();
+          renderBreadcrumbs();
+          highlightTreeSelection();
+          setStatus('No element selected');
         }
         break;
       case 'CHANGES_LOADED':
@@ -155,6 +172,11 @@
     state.tree.nodesBySelector.clear();
     state.forcedStates = [];
     state.ancestors = [];
+    // A tab switch strands picker state — the new tab's content script has
+    // its own (inactive) picker, so reset ours instead of wedging on a
+    // STOP_PICKER that will never broadcast back.
+    state.pickerActive = false;
+    document.getElementById('btn-pick').classList.remove('active');
     syncHovUI();
     renderBreadcrumbs();
 
@@ -437,7 +459,15 @@
     const raw = info.outerHTML;
     const pretty = prettyHtml(raw);
 
-    const original = row.innerHTML;
+    // Keep the actual child nodes (not an innerHTML snapshot) so their
+    // event listeners — the expand/collapse toggle's click handler in
+    // particular — survive a cancel.
+    const originalNodes = Array.from(row.childNodes);
+    const restoreRow = () => {
+      row.classList.remove('editing');
+      row.innerHTML = '';
+      row.append(...originalNodes);
+    };
     row.classList.add('editing');
     row.innerHTML = '';
 
@@ -470,15 +500,13 @@
     const cancel = () => {
       if (done) return;
       done = true;
-      row.classList.remove('editing');
-      row.innerHTML = original;
+      restoreRow();
     };
     const commit = async () => {
       if (done) return;
       done = true;
       const newHtml = ta.value;
-      row.classList.remove('editing');
-      row.innerHTML = original;
+      restoreRow();
       if (newHtml.trim() === pretty.trim() || newHtml.trim() === raw.trim()) return;
       const r = await send('APPLY_HTML', {
         payload: {
@@ -663,7 +691,11 @@
   async function deleteSelectedElement(selector) {
     const target = selector || state.selected;
     if (!target) return;
-    await send('DELETE_ELEMENT', { selector: target });
+    const r = await send('DELETE_ELEMENT', { selector: target });
+    if (r && r.ok === false) {
+      setStatus(`Delete failed: ${r.error || 'element not found'}`);
+      return;
+    }
     if (state.selected && selKey(state.selected) === selKey(target)) {
       state.selected = null;
       state.selectedInfo = null;
@@ -678,7 +710,11 @@
   async function duplicateElement(selector) {
     const target = selector || state.selected;
     if (!target) return;
-    await send('DUPLICATE_ELEMENT', { selector: target });
+    const r = await send('DUPLICATE_ELEMENT', { selector: target });
+    if (r && r.ok === false) {
+      setStatus(`Duplicate failed: ${r.error || 'element not found'}`);
+      return;
+    }
     await refreshAfterMutation();
     setStatus('Element duplicated');
   }
@@ -935,6 +971,7 @@
             important: true,
             edited: true,
             disabled: !!e.disabled,
+            authorDisable: !!e.authorDisable,
             id: e.id,
           };
         } else {
@@ -944,6 +981,7 @@
             important: true,
             edited: true,
             disabled: !!e.disabled,
+            authorDisable: !!e.authorDisable,
             id: e.id,
             _added: true,
           });
@@ -984,10 +1022,16 @@
       ...authorRules,
     ];
 
-    // Orphan edits — selector doesn't match any rendered rule.
+    // Orphan edits — selector doesn't match any rendered rule, but DOES
+    // match the selected element (content script verifies via el.matches /
+    // xpath resolution). Without this filter, every page-wide edit would
+    // show up under every selection, and its controls would silently
+    // mutate a different element's record.
+    const matchingSet = new Set(info.matchingChangeSelectors || []);
     const orphans = new Map();
     for (const [key, e] of changesByKey.entries()) {
       if (consumedKeys.has(key)) continue;
+      if (!matchingSet.has(e.selector)) continue;
       if (!orphans.has(e.selector)) orphans.set(e.selector, []);
       orphans.get(e.selector).push({
         name: e.property,
@@ -995,9 +1039,13 @@
         important: true,
         edited: true,
         disabled: !!e.disabled,
+        authorDisable: !!e.authorDisable,
         id: e.id,
         _added: true,
       });
+      if (!orphans.get(e.selector).targetType) {
+        orphans.get(e.selector).targetType = e.selectorType || 'css';
+      }
     }
     for (const [sel, props] of orphans.entries()) {
       rules.push({
@@ -1008,6 +1056,7 @@
         properties: props,
         editable: true,
         targetSelector: sel,
+        targetType: props.targetType || 'css',
       });
     }
 
@@ -1137,7 +1186,7 @@
   function selectorFor(rule) {
     return rule.kind === 'inline'
       ? state.selected
-      : { type: 'css', value: rule.targetSelector };
+      : { type: rule.targetType || 'css', value: rule.targetSelector };
   }
 
   function editPropName(span, p, rule) {
@@ -1432,7 +1481,11 @@
     const sel = selectorFor(rule);
 
     if (!disabled) {
-      if (p.edited && !p._added && p.id) {
+      // Re-check. Only records that exist purely because the user unchecked
+      // an author property (authorDisable) should be deleted so the author
+      // cascade resumes — a record holding a REAL edit must be re-enabled
+      // with its value intact, or edit → uncheck → recheck loses the edit.
+      if (p.edited && p.authorDisable && p.id) {
         await send('REVERT_CHANGE', { id: p.id });
       } else {
         await send('APPLY_STYLE', {
@@ -1440,8 +1493,17 @@
         });
       }
     } else {
+      // Uncheck. Tag records created by disabling a never-edited author
+      // property so the re-check branch can tell them apart from edits.
       await send('APPLY_STYLE', {
-        payload: { selector: sel, property: p.name, value: p.value, disabled: true, elementLabel: state.selected.value },
+        payload: {
+          selector: sel,
+          property: p.name,
+          value: p.value,
+          disabled: true,
+          authorDisable: !p.edited,
+          elementLabel: state.selected.value,
+        },
       });
     }
     await loadElementInfo();

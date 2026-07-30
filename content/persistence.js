@@ -23,10 +23,11 @@ const Persistence = (() => {
   // sibling after each apply and every reapply would delete one more element.
   const _appliedRemoves = new Set();
 
-  // Live-element registry for HTML-edited nodes. After an outerHTML replace
+  // Live-node registry for HTML-edited records. After an outerHTML replace
   // the stored selector may no longer resolve (e.g. span → button), so we
-  // remember which live node each __html__ record currently owns.
-  const _liveEls = new Map(); // record id → Element
+  // remember which live nodes each __html__ record currently owns. A record
+  // can own multiple roots (the user replaced one element with several).
+  const _liveEls = new Map(); // record id → Node[] (element roots + text nodes)
 
   // When we mutate the DOM ourselves, the MutationObserver would otherwise
   // re-fire reapply() in a loop. Mark a settle window after destructive
@@ -43,7 +44,20 @@ const Persistence = (() => {
   let _undoStack = []; // Array<{ label, ops: [{id, before, after}], at }>
   let _redoStack = [];
 
+  function isNoopOp(op) {
+    if (!op.before && !op.after) return true;
+    if (op.before && op.after) {
+      try {
+        return JSON.stringify(op.before) === JSON.stringify(op.after);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
   function pushHistory(label, ops) {
+    ops = ops.filter((op) => !isNoopOp(op));
     if (!ops.length) return;
     const now = Date.now();
     // Coalesce rapid edits to the same single record (live typing, color
@@ -60,6 +74,10 @@ const Persistence = (() => {
       top.ops[0].after = ops[0].after;
       top.label = label;
       top.at = now;
+      // Coalescing can neutralize an entry (create → delete within the
+      // window nets to before:null after:null) — drop it so ⌘Z doesn't
+      // "undo" nothing.
+      if (isNoopOp(top.ops[0])) _undoStack.pop();
       _redoStack = [];
       broadcastUndoState();
       return;
@@ -92,10 +110,19 @@ const Persistence = (() => {
       await PersistDB.putChange({ ...target });
       applyRecord(target);
     } else if (other) {
-      // Record is being removed in this direction → unapply from DOM + IDB.
+      // Record is being removed in this direction → unapply from DOM first;
+      // a failed structural unapply means the record still holds the only
+      // copy of the original markup — keep it rather than orphaning the DOM.
+      const ok = unapplyRecord(other);
+      if (!ok && (other.property === '__html__' || other.property === '__remove__')) {
+        notifyPanel('REVERT_FAILED', {
+          id: op.id,
+          reason: 'Element could not be restored (page may have re-rendered). The change record was kept.',
+        });
+        return;
+      }
       _cache.delete(op.id);
       await PersistDB.deleteChange(op.id);
-      unapplyRecord(other);
     }
   }
 
@@ -194,9 +221,18 @@ const Persistence = (() => {
 
   // ─── Record application ────────────────────────────────────────────────────
 
+  function liveNodes(record) {
+    const nodes = _liveEls.get(record.id);
+    if (nodes && nodes.length && nodes.every((n) => n.isConnected)) return nodes;
+    return null;
+  }
+
   function findLive(record) {
-    const live = _liveEls.get(record.id);
-    if (live && live.isConnected) return live;
+    const nodes = liveNodes(record);
+    if (nodes) {
+      const firstEl = nodes.find((n) => n.nodeType === 1);
+      if (firstEl) return firstEl;
+    }
     return SelectorEngine.find({ type: record.selectorType, value: record.selector });
   }
 
@@ -207,60 +243,93 @@ const Persistence = (() => {
   }
 
   /**
-   * Swap `el` for the parsed markup. Handles multi-root markup (all nodes
-   * inserted, first element tracked) and html/body/head targets, which
-   * cannot be replaceWith()'d — for those, copy attributes + children from
-   * the parsed same-tag element instead.
+   * Canonicalize markup: parse and re-serialize so it compares reliably
+   * against live DOM serializations (attribute quoting, entity encoding,
+   * boolean attributes, tag case all normalize).
    */
-  function swapElementWithMarkup(el, html, recordId) {
+  function normalizeHtml(html) {
+    const tmpl = document.createElement('template');
+    tmpl.innerHTML = html;
+    const div = document.createElement('div');
+    div.appendChild(tmpl.content.cloneNode(true));
+    return div.innerHTML;
+  }
+
+  function serializeNodes(nodes) {
+    const div = document.createElement('div');
+    for (const n of nodes) div.appendChild(n.cloneNode(true));
+    return div.innerHTML;
+  }
+
+  /**
+   * Swap `el` (plus optional extra tracked roots) for the parsed markup.
+   * Handles multi-root markup (all nodes inserted and tracked) and
+   * html/body/head targets, which cannot be replaceWith()'d — for those,
+   * copy attributes + children from a DOMParser parse (template parsers
+   * silently drop html/body/head tags).
+   */
+  function swapElementWithMarkup(el, html, recordId, extraRoots = []) {
     const tag = el.tagName.toLowerCase();
     if (tag === 'html' || tag === 'body' || tag === 'head') {
-      const frag = parseTemplate(tag === 'body' || tag === 'head' ? `<${tag}>${html}</${tag}>` : html);
-      // For structural roots, parse yields content directly (template drops
-      // html/body tags) — replace children and leave the element in place.
+      const looksWrapped = new RegExp(`<${tag}[\\s>]`, 'i').test(html);
+      const doc = new DOMParser().parseFromString(
+        looksWrapped ? html : `<${tag}>${html}</${tag}>`,
+        'text/html'
+      );
+      const parsedSame = doc.querySelector(tag);
+      if (!parsedSame) return el; // parse failed — leave the DOM alone
       while (el.attributes.length) el.removeAttribute(el.attributes[0].name);
-      const parsedSame = frag.querySelector(tag);
-      if (parsedSame) {
-        for (const a of Array.from(parsedSame.attributes)) el.setAttribute(a.name, a.value);
-      }
+      for (const a of Array.from(parsedSame.attributes)) el.setAttribute(a.name, a.value);
       el.innerHTML = '';
-      el.append(...Array.from((parsedSame || frag).childNodes));
-      if (recordId) _liveEls.set(recordId, el);
+      el.append(...Array.from(parsedSame.childNodes));
+      if (recordId) _liveEls.set(recordId, [el]);
       return el;
     }
     const frag = parseTemplate(html);
     const first = frag.firstElementChild;
+    // Remove any additional roots a previous multi-root apply inserted.
+    for (const extra of extraRoots) {
+      if (extra !== el && extra.isConnected) extra.remove();
+    }
     if (!first) {
       // Text-only replacement — keep the element, swap contents.
       el.innerHTML = html;
-      if (recordId) _liveEls.set(recordId, el);
+      if (recordId) _liveEls.set(recordId, [el]);
       return el;
     }
-    el.replaceWith(...Array.from(frag.childNodes));
-    if (recordId) _liveEls.set(recordId, first);
+    const nodes = Array.from(frag.childNodes);
+    el.replaceWith(...nodes);
+    if (recordId) _liveEls.set(recordId, nodes);
     return first;
   }
 
   function applyHtmlChange(record) {
-    const el = findLive(record);
-    if (!el) return false;
+    const tracked = liveNodes(record);
     // Idempotence: silent reapplies (MutationObserver settles) must not
     // re-replace an already-applied subtree — that would reset focus and
-    // listeners every time the SPA re-renders elsewhere.
-    if (el.outerHTML === record.value) {
-      _liveEls.set(record.id, el);
+    // listeners on every unrelated SPA re-render. Compare canonical
+    // serializations of ALL tracked roots (record.value is normalized at
+    // save time, so byte-equality is meaningful).
+    if (tracked && serializeNodes(tracked) === record.value) return true;
+    const el = findLive(record);
+    if (!el) return false;
+    if (!tracked && el.outerHTML === record.value) {
+      _liveEls.set(record.id, [el]);
       return true;
     }
     markOurMutation();
-    swapElementWithMarkup(el, record.value, record.id);
+    swapElementWithMarkup(el, record.value, record.id, tracked || []);
     return true;
   }
 
   function unapplyHtmlChange(record) {
+    if (record.originalValue == null) return false;
+    const tracked = liveNodes(record);
     const el = findLive(record);
-    if (!el || record.originalValue == null) return false;
+    if (!el) return false;
     markOurMutation();
-    swapElementWithMarkup(el, record.originalValue, null);
+    // Multi-root edits: every tracked root must go, not just the first.
+    swapElementWithMarkup(el, record.originalValue, null, tracked || []);
     _liveEls.delete(record.id);
     return true;
   }
@@ -530,8 +599,14 @@ const Persistence = (() => {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
     const id = input.id || `${urlPattern}::${input.selector}::${input.property}`;
     const before = _cache.get(id) || null;
+    // Canonicalize HTML values so the idempotence check (serialization vs
+    // serialization) holds — raw textarea text with unquoted attributes or
+    // bare '&' would never byte-match the DOM and cause endless re-swaps.
+    const value =
+      input.property === '__html__' ? normalizeHtml(input.value) : input.value;
     const record = {
       ...input,
+      value,
       id,
       urlPattern,
       timestamp: Date.now(),
@@ -624,18 +699,32 @@ const Persistence = (() => {
     _saveTimers.clear();
   }
 
-  async function clearAll() {
-    cancelAllTimers();
-    const records = Array.from(_cache.values());
-    const ops = records.map((r) => ({ id: r.id, before: { ...r }, after: null }));
-
-    // Unapply structural edits (restore original DOM), then wipe the sheet.
+  /**
+   * Roll back every applied record in reverse-apply order: removals get
+   * re-inserted, HTML edits restored newest-first, and non-sheet CSS
+   * (xpath → inline styles) removed. The override sheet is wiped wholesale.
+   */
+  function unapplyAllRecords(records) {
     for (const r of orderRecords(records).reverse()) {
-      if (r.property === '__html__' || r.property === '__remove__') {
+      if (
+        r.property === '__html__' ||
+        r.property === '__remove__' ||
+        r.selectorType === 'xpath'
+      ) {
         unapplyRecord(r);
       }
     }
     wipeSheet();
+  }
+
+  async function clearAll() {
+    cancelAllTimers();
+    // Ops in apply order so undo (which replays them reversed) restores
+    // removals first, then HTML newest-first, then CSS.
+    const records = orderRecords(Array.from(_cache.values()));
+    const ops = records.map((r) => ({ id: r.id, before: { ...r }, after: null }));
+
+    unapplyAllRecords(records);
 
     await PersistDB.clearChangesForUrl(_currentUrl);
     _cache.clear();
@@ -645,15 +734,11 @@ const Persistence = (() => {
 
   async function restoreSnapshot(snapshotChanges) {
     cancelAllTimers();
-    const current = Array.from(_cache.values());
+    const current = orderRecords(Array.from(_cache.values()));
     const ops = [];
     for (const r of current) ops.push({ id: r.id, before: { ...r }, after: null });
 
-    // Roll back current structural edits first.
-    for (const r of orderRecords(current).reverse()) {
-      if (r.property === '__html__' || r.property === '__remove__') unapplyRecord(r);
-    }
-    wipeSheet();
+    unapplyAllRecords(current);
     await PersistDB.clearChangesForUrl(_currentUrl);
     _cache.clear();
 
@@ -682,8 +767,10 @@ const Persistence = (() => {
   }
 
   function getLiveElement(id) {
-    const el = _liveEls.get(id);
-    return el && el.isConnected ? el : null;
+    const nodes = _liveEls.get(id);
+    if (!nodes || !nodes.length) return null;
+    const firstEl = nodes.find((n) => n.nodeType === 1);
+    return firstEl && firstEl.isConnected ? firstEl : null;
   }
 
   return {

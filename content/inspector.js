@@ -82,10 +82,9 @@
   // ─── Selection ─────────────────────────────────────────────────────────────
 
   function selectElement(el) {
-    // Selection change clears any forced pseudo-states on the old element.
-    if (_selected && _selected !== el) {
-      StylesEngine.forceStates(null, []);
-    }
+    // Any (re-)selection clears forced pseudo-states — the panel resets its
+    // :hov checkboxes on every ELEMENT_SELECTED, so the page must match.
+    StylesEngine.forceStates(null, []);
     if (!el) {
       _selected = null;
       _selectedSelector = null;
@@ -174,6 +173,26 @@
   async function elementInfo(selectorObj) {
     const el = selectorObj ? SelectorEngine.find(selectorObj) : _selected;
     if (!el) return null;
+
+    // Which persisted CSS-change selectors actually match this element —
+    // the panel uses this to avoid rendering unrelated elements' edits as
+    // orphan rules under the wrong selection.
+    const matchingChangeSelectors = [];
+    for (const c of Persistence.getCurrentChanges()) {
+      if (c.property === '__html__' || c.property === '__remove__') continue;
+      try {
+        const matches =
+          c.selectorType === 'xpath'
+            ? SelectorEngine.find({ type: 'xpath', value: c.selector }) === el
+            : el.matches(c.selector);
+        if (matches && !matchingChangeSelectors.includes(c.selector)) {
+          matchingChangeSelectors.push(c.selector);
+        }
+      } catch {
+        /* invalid selector — not a match */
+      }
+    }
+
     return {
       selector: SelectorEngine.generate(el),
       describe: describeElement(el),
@@ -181,6 +200,7 @@
       matched: await StylesEngine.matchedRules(el),
       computed: StylesEngine.computedSnapshot(el),
       box: StylesEngine.boxModel(el),
+      matchingChangeSelectors,
       outerHTML: el.outerHTML.length < 50000 ? stripMarkers(el.outerHTML) : null,
       innerHTML: el.innerHTML.length < 50000 ? stripMarkers(el.innerHTML) : null,
     };
@@ -188,26 +208,36 @@
 
   // ─── Edits ─────────────────────────────────────────────────────────────────
 
-  function applyStyleEdit({ selector, property, value, disabled, elementLabel }) {
+  function applyStyleEdit({ selector, property, value, disabled, authorDisable, elementLabel }) {
     return Persistence.saveChange({
       selector: selector.value,
       selectorType: selector.type,
       property,
       value,
       disabled: !!disabled,
+      // Marks records that exist ONLY because the user unchecked an author
+      // property — re-checking those should delete the record, while
+      // re-checking a real edit should restore its value.
+      authorDisable: !!authorDisable,
       elementTag: _selected?.tagName?.toLowerCase() || null,
       elementLabel: elementLabel || null,
     });
   }
 
   async function applyHtmlEdit({ selector, value, originalValue, elementLabel }) {
+    // Remember whether the edit target IS the current selection — a
+    // descendant of the edited node also gets disconnected, and adopting
+    // the ancestor in that case would desync overlay vs Styles pane.
+    const target = SelectorEngine.find(selector);
+    const editedWasSelection = !!target && target === _selected;
+
     const record = await Persistence.saveChange({
       selector: selector.value,
       selectorType: selector.type,
       property: '__html__',
       value,
       originalValue,
-      elementTag: _selected?.tagName?.toLowerCase() || null,
+      elementTag: target?.tagName?.toLowerCase() || null,
       elementLabel: elementLabel || null,
     });
     // The replacement element may have a different tag/id/class, so the old
@@ -217,12 +247,14 @@
     let newSelector = null;
     if (live) {
       newSelector = SelectorEngine.generate(live);
-      if (_selected && !_selected.isConnected) {
+      if (editedWasSelection) {
         _selected = live;
         _selectedSelector = newSelector;
         Overlay.showSelected(live);
       }
-    } else if (_selected && !_selected.isConnected) {
+    }
+    if (_selected && !_selected.isConnected) {
+      // Selection was inside the replaced subtree — clear it honestly.
       selectElement(null);
     }
     return { record, newSelector };
@@ -233,7 +265,10 @@
    * (parent selector + child index + outerHTML) so revert/undo can
    * re-insert it at the same position.
    */
-  function deleteElement(selectorObj) {
+  async function deleteElement(selectorObj) {
+    // Marker classes must not end up in captured outerHTML (they'd diverge
+    // from the stripped record value and confuse the idempotence check).
+    await StylesEngine.forceStates(null, []);
     const el = SelectorEngine.find(selectorObj);
     if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
     const parent = el.parentElement;
@@ -257,7 +292,11 @@
    * Duplicate an element: insert a clone after it, persisted as an
    * __html__ edit on the parent (its outerHTML captures the duplication).
    */
-  function duplicateElement(selectorObj) {
+  async function duplicateElement(selectorObj) {
+    // Clear forced-state marker classes first — capturing parent.outerHTML
+    // with markers present would diverge from the stripped record value and
+    // trigger an immediate destructive parent re-swap.
+    await StylesEngine.forceStates(null, []);
     const el = SelectorEngine.find(selectorObj);
     if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
     const parent = el.parentElement;
@@ -304,7 +343,10 @@
         return { ok: true };
       case 'STOP_PICKER':
         stopPicker();
-        return { ok: true };
+        // Always broadcast — stopPicker early-returns when already inactive,
+        // and a panel that got out of sync (tab switch) needs the correction.
+        notifyPanel('PICKER_STATE', { active: _pickerActive });
+        return { ok: true, active: _pickerActive };
       case 'GET_TREE_CHILDREN':
         return { nodes: getChildren(msg.selector) };
       case 'GET_TREE_ANCESTORS':
