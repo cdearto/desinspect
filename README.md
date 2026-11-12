@@ -44,6 +44,8 @@ Then open `chrome://extensions` (Chrome 116+), turn on **Developer mode**, click
 
 `npm run typecheck` checks types without writing files.
 
+`npm test` builds the extension and runs an end-to-end smoke test (`tests/smoke.js`): it loads `dist/` into headless Chromium and drives the side panel against a small test page — styles, undo/redo, `:hov`, HTML edits, delete, persistence across reload, snapshots, and SPA navigation. The first time, install the browser with `npx playwright install chromium`.
+
 ## Keyboard shortcuts
 
 | Key | Where | Action |
