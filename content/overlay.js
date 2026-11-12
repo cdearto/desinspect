@@ -139,31 +139,17 @@ const Overlay = (() => {
     if (_selectedEl) showSelected(_selectedEl);
   }
 
-  function hide() {
-    clearLayer('hover');
-    clearLayer('selected');
-    _hoverEl = null;
-    _selectedEl = null;
+  // Keep the highlights glued to their elements. The interval covers layout
+  // shifts that fire no event (transitions, late-loading content).
+  function repaint() {
+    if (_hoverEl) showHover(_hoverEl);
+    if (_selectedEl) showSelected(_selectedEl);
   }
+  window.addEventListener('scroll', repaint, true);
+  window.addEventListener('resize', repaint);
+  setInterval(refreshSelected, 1000);
 
-  function destroy() {
-    if (_root) _root.remove();
-    _root = null;
-    _hoverEl = null;
-    _selectedEl = null;
-  }
-
-  function bindRepaint() {
-    const repaint = () => {
-      if (_hoverEl) showHover(_hoverEl);
-      if (_selectedEl) showSelected(_selectedEl);
-    };
-    window.addEventListener('scroll', repaint, true);
-    window.addEventListener('resize', repaint);
-  }
-  bindRepaint();
-
-  return { showHover, showSelected, refreshSelected, hide, destroy };
+  return { showHover, showSelected };
 })();
 
 if (typeof window !== 'undefined') window.Overlay = Overlay;

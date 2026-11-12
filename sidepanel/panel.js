@@ -17,17 +17,17 @@
     pickerActive: false,
     selected: null,             // { type, value }
     selectedInfo: null,         // full info object from page
-    tree: { rootChildren: [], expanded: new Map(), nodesBySelector: new Map() },
+    tree: { rootChildren: [], expanded: new Set(), nodesBySelector: new Map() },
     changes: [],                // current URL's persisted changes
     snapshots: [],
-    activeTab: 'styles',
     forcedStates: [],           // active :hov forced states
     ancestors: [],              // breadcrumb chain for current selection
-    tabId: null,                // the inspected tab — URL_CHANGED for other tabs is noise
+    tabId: null,                // the inspected tab; pushes from other tabs are ignored
+    windowId: null,             // the window this panel lives in
   };
 
   let _infoToken = 0;           // discards stale GET_ELEMENT_INFO responses
-  let _reinitTimer = null;      // de-dupes double URL_CHANGED (onCommitted + onHistoryStateUpdated)
+  let _reinitTimer = null;
   const _childLoads = new Map(); // selectorKey → pending children fetch (revealInTree awaits these)
 
   const CSS_PROPS = [
@@ -51,23 +51,43 @@
 
   // ─── Messaging ──────────────────────────────────────────────────────────
 
+  // The tab this panel inspects: the active tab of the panel's own window.
+  const tabReady = chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+    state.tabId = tab?.id ?? null;
+    state.windowId = tab?.windowId ?? null;
+  });
+
+  /** Send a message to the inspected tab's content script; null on failure. */
   async function send(type, payload = {}) {
-    const r = await chrome.runtime
-      .sendMessage({ target: 'content', payload: { type, ...payload } })
-      .catch((e) => ({ ok: false, error: String(e) }));
-    if (!r) return null;
-    if (!r.ok) {
-      console.warn('[DesInspect panel] send failed:', type, r.error);
-      return null;
+    await tabReady;
+    if (state.tabId == null) return null;
+    try {
+      const r = await chrome.tabs.sendMessage(state.tabId, { type, ...payload });
+      if (r?.ok) return r.data ?? null;
+      console.warn('[DesInspect panel]', type, 'failed:', r?.error);
+    } catch {
+      // No content script in this tab (chrome:// pages, or still loading).
     }
-    return r.response?.data || null;
+    return null;
   }
 
+  // Coalesces bursts: one navigation fires several URL_CHANGED events.
+  function scheduleReinit() {
+    clearTimeout(_reinitTimer);
+    _reinitTimer = setTimeout(initFromTab, 250);
+  }
+
+  chrome.tabs.onActivated.addListener((info) => {
+    if (info.windowId !== state.windowId) return;
+    state.tabId = info.tabId;
+    scheduleReinit();
+  });
+
   chrome.runtime.onMessage.addListener((msg, sender) => {
-    // Content scripts in EVERY tab push messages (CHANGES_LOADED on load,
-    // UNDO_STATE on SPA nav, …). Only the inspected tab's pushes matter —
-    // a background tab reloading must not clobber this panel's state.
-    if (sender?.tab && state.tabId != null && sender.tab.id !== state.tabId) return;
+    // Content scripts in every tab push messages; only the inspected tab's
+    // matter. (URL_CHANGED comes from the service worker and carries tabId.)
+    const fromTab = sender.tab?.id ?? msg?.tabId;
+    if (fromTab != null && fromTab !== state.tabId) return;
     switch (msg?.type) {
       case 'PICKER_STATE':
         state.pickerActive = msg.data.active;
@@ -76,29 +96,20 @@
         else if (!state.selected) setStatus('No element selected');
         break;
       case 'ELEMENT_SELECTED':
-        if (msg.data.selector) {
-          state.selected = msg.data.selector;
-          state.forcedStates = [];
-          syncHovUI();
-          loadElementInfo();
-          if (!state.tree.rootChildren.length) {
-            refreshTreeRoot().then(() => revealInTree(state.selected));
-          } else {
-            revealInTree(state.selected);
-          }
-        } else {
-          // Page-side deselection (e.g. selection was inside a replaced
-          // subtree) — reflect it instead of showing stale panes.
-          state.selected = null;
-          state.selectedInfo = null;
-          state.forcedStates = [];
-          syncHovUI();
-          renderStyles();
-          renderComputed();
-          renderBox();
-          renderBreadcrumbs();
+        state.selected = msg.data.selector;
+        state.forcedStates = [];
+        syncHovUI();
+        loadElementInfo();
+        if (!state.selected) {
+          // Page-side deselection (e.g. the selection was deleted/replaced).
+          state.ancestors = [];
           highlightTreeSelection();
           setStatus('No element selected');
+        } else if (!state.tree.rootChildren.length) {
+          // The initial tree fetch raced the content script — retry now.
+          refreshTreeRoot().then(() => revealInTree(state.selected));
+        } else {
+          revealInTree(state.selected);
         }
         break;
       case 'CHANGES_LOADED':
@@ -119,29 +130,13 @@
         refreshAfterMutation();
         break;
       case 'URL_CHANGED':
-        // Only react to the tab we're inspecting — the SW broadcasts for
-        // every tab, and a pinned tab auto-refreshing shouldn't wipe the
-        // panel. onCommitted + onHistoryStateUpdated also double-fire for
-        // one navigation, so coalesce.
-        if (state.tabId != null && msg.tabId != null && msg.tabId !== state.tabId) break;
-        clearTimeout(_reinitTimer);
-        _reinitTimer = setTimeout(initFromTab, 250);
+        scheduleReinit();
         break;
       case 'REVERT_FAILED':
-        setStatus(msg.data?.reason || 'Revert failed — change kept.');
+        setStatus(msg.data.reason);
         loadChanges();
         break;
     }
-  });
-
-  // Track which tab the panel is inspecting; re-init when the user switches.
-  chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-    if (tab?.id != null) state.tabId = tab.id;
-  }).catch(() => {});
-  chrome.tabs.onActivated?.addListener((info) => {
-    state.tabId = info.tabId;
-    clearTimeout(_reinitTimer);
-    _reinitTimer = setTimeout(initFromTab, 250);
   });
 
   function setStatus(text) {
@@ -153,14 +148,20 @@
     document.getElementById('btn-redo').disabled = !canRedo;
   }
 
-  /** Everything that needs re-syncing after a page-side mutation. */
-  async function refreshAfterMutation() {
+  /**
+   * Re-sync after a style edit. Changes load first: the Styles tab merges
+   * them into the rules it renders.
+   */
+  async function refreshStyles() {
     await loadChanges();
+    await loadElementInfo();
+  }
+
+  /** Re-sync everything after an edit that may have changed the DOM. */
+  async function refreshAfterMutation() {
     await refreshTreeRoot();
-    if (state.selected) {
-      await loadElementInfo();
-      await revealInTree(state.selected, { scroll: false });
-    }
+    await refreshStyles();
+    await revealInTree(state.selected);
   }
 
   // ─── Init ────────────────────────────────────────────────────────────────
@@ -188,22 +189,14 @@
     setStatus('No element selected');
   }
 
-  async function refreshTreeRoot({ invalidateCache = true } = {}) {
+  /** Re-fetch the tree from the page; expanded nodes stay expanded. */
+  async function refreshTreeRoot() {
     // The content script may not be live yet when the panel first opens.
     let r = null;
     for (let i = 0; i < 5; i++) {
       r = await send('GET_TREE_CHILDREN', { selector: null });
       if (r?.nodes?.length) break;
       await new Promise((res) => setTimeout(res, 200));
-    }
-    if (invalidateCache) {
-      // Keep which nodes are expanded but drop their cached child lists so
-      // HTML edits show up without a manual refresh.
-      for (const key of Array.from(state.tree.expanded.keys())) {
-        if (Array.isArray(state.tree.expanded.get(key))) {
-          state.tree.expanded.set(key, true);
-        }
-      }
     }
     state.tree.rootChildren = r?.nodes || [];
     renderTree();
@@ -242,35 +235,28 @@
   function renderTreeNode(node, depth) {
     const key = selKey(node.selector);
     state.tree.nodesBySelector.set(key, node);
+    const hasChildren = node.childCount > 0;
+    const expanded = hasChildren && state.tree.expanded.has(key);
 
     const wrap = document.createElement('div');
     wrap.className = 'tree-node';
-    wrap.dataset.selectorKey = key;
+    wrap.dataset.depth = depth;
 
     const row = document.createElement('div');
     row.className = 'tree-row';
     row.dataset.selectorKey = key;
-
-    const indent = document.createElement('span');
-    indent.className = 'tree-indent';
-    indent.style.width = depth * 12 + 'px';
-    row.appendChild(indent);
+    row.appendChild(makeIndent(depth));
 
     const toggle = document.createElement('span');
     toggle.className = 'tree-toggle';
-    const hasChildren = node.childCount > 0;
-    const expanded = state.tree.expanded.get(key);
     if (hasChildren) {
-      toggle.classList.add('has-children');
-      toggle.classList.add(expanded ? 'expanded' : 'collapsed');
+      toggle.classList.add('has-children', expanded ? 'expanded' : 'collapsed');
+      toggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleNode(node, wrap);
+      });
     }
-    toggle.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (!hasChildren) return;
-      toggleNode(node, wrap, toggle, depth);
-    });
     row.appendChild(toggle);
-
     row.appendChild(renderOpenTag(node));
 
     if (!hasChildren && node.hasText) {
@@ -278,16 +264,8 @@
       txt.className = 'tree-text';
       txt.textContent = truncate(node.hasText, 40);
       row.appendChild(txt);
-      row.appendChild(renderCloseTag(node));
-    } else if (!hasChildren) {
-      row.appendChild(renderCloseTag(node));
-    } else if (!expanded) {
-      const dots = document.createElement('span');
-      dots.className = 'tree-close';
-      dots.textContent = '…';
-      row.appendChild(dots);
-      row.appendChild(renderCloseTag(node));
     }
+    if (!expanded) row.appendChild(renderCloseTag(node, hasChildren));
 
     const dot = document.createElement('span');
     dot.className = 'tree-modified-marker';
@@ -309,127 +287,85 @@
     });
 
     wrap.appendChild(row);
-
-    if (expanded && hasChildren) {
-      const childContainer = document.createElement('div');
-      childContainer.className = 'tree-children';
-      wrap.appendChild(childContainer);
-      const cached = state.tree.expanded.get(key);
-      if (Array.isArray(cached)) {
-        for (const c of cached) childContainer.appendChild(renderTreeNode(c, depth + 1));
-      } else {
-        // Track the pending fetch so revealInTree can await it instead of
-        // walking past a not-yet-rendered subtree.
-        const load = send('GET_TREE_CHILDREN', { selector: node.selector }).then((r) => {
-          _childLoads.delete(key);
-          if (!state.tree.expanded.has(key)) return; // collapsed meanwhile
-          const children = r?.nodes || [];
-          state.tree.expanded.set(key, children);
-          childContainer.innerHTML = '';
-          for (const c of children) childContainer.appendChild(renderTreeNode(c, depth + 1));
-          annotateTreeWithChanges();
-          highlightTreeSelection();
-        });
-        _childLoads.set(key, load);
-      }
-      const closingRow = document.createElement('div');
-      closingRow.className = 'tree-row tree-close-row';
-      const ind = document.createElement('span');
-      ind.className = 'tree-indent';
-      ind.style.width = depth * 12 + 'px';
-      const sp = document.createElement('span');
-      sp.className = 'tree-toggle';
-      closingRow.appendChild(ind);
-      closingRow.appendChild(sp);
-      closingRow.appendChild(renderCloseTag(node));
-      wrap.appendChild(closingRow);
-    }
-
+    if (expanded) renderChildren(node, wrap);
     return wrap;
   }
 
-  function selectNode(node) {
-    send('SELECT', { selector: node.selector });
-    state.selected = node.selector;
-    state.forcedStates = [];
-    syncHovUI();
-    loadElementInfo();
-    highlightTreeSelection();
-    loadBreadcrumbs();
+  function makeIndent(depth) {
+    const indent = document.createElement('span');
+    indent.className = 'tree-indent';
+    indent.style.width = depth * 12 + 'px';
+    return indent;
   }
 
-  async function toggleNode(node, wrap, toggle, depth) {
+  /**
+   * Fill in an expanded node: its children (fetched from the page) and the
+   * closing-tag row. The fetch is tracked in _childLoads so revealInTree can
+   * wait for it instead of walking past a not-yet-rendered subtree.
+   */
+  function renderChildren(node, wrap) {
     const key = selKey(node.selector);
-    const isExpanded = toggle.classList.contains('expanded');
-    if (isExpanded) {
-      state.tree.expanded.delete(key);
-      toggle.classList.remove('expanded');
-      toggle.classList.add('collapsed');
-      const children = wrap.querySelector('.tree-children');
-      if (children) children.remove();
-      const closeRow = wrap.querySelector('.tree-close-row');
-      if (closeRow) closeRow.remove();
-      const row = wrap.querySelector('.tree-row');
-      row.querySelector('.tree-close')?.remove();
-      const dots = document.createElement('span');
-      dots.className = 'tree-close';
-      dots.textContent = '…';
-      row.appendChild(dots);
-      row.appendChild(renderCloseTag(node));
-    } else {
-      state.tree.expanded.set(key, true);
-      toggle.classList.remove('collapsed');
-      toggle.classList.add('expanded');
-      const row = wrap.querySelector('.tree-row');
-      row.querySelectorAll('.tree-close').forEach((n) => n.remove());
+    const depth = Number(wrap.dataset.depth);
 
-      let cc = wrap.querySelector('.tree-children');
-      if (cc) cc.remove();
-      cc = document.createElement('div');
-      cc.className = 'tree-children';
-      wrap.appendChild(cc);
+    const container = document.createElement('div');
+    container.className = 'tree-children';
+    const closingRow = document.createElement('div');
+    closingRow.className = 'tree-row tree-close-row';
+    const spacer = document.createElement('span');
+    spacer.className = 'tree-toggle';
+    closingRow.append(makeIndent(depth), spacer, renderCloseTag(node, false));
+    wrap.append(container, closingRow);
 
-      const load = (async () => {
-        const r = await send('GET_TREE_CHILDREN', { selector: node.selector });
-        // Bail if the user collapsed the node while the fetch was in
-        // flight — applying anyway would resurrect it as expanded and
-        // leave a stray closing-tag row.
-        if (!state.tree.expanded.has(key) || !toggle.classList.contains('expanded')) return;
-        const children = r?.nodes || [];
-        state.tree.expanded.set(key, children);
-        cc.innerHTML = '';
-        for (const c of children) cc.appendChild(renderTreeNode(c, depth + 1));
-
-        const closingRow = document.createElement('div');
-        closingRow.className = 'tree-row tree-close-row';
-        const ind = document.createElement('span');
-        ind.className = 'tree-indent';
-        ind.style.width = depth * 12 + 'px';
-        const sp = document.createElement('span');
-        sp.className = 'tree-toggle';
-        closingRow.appendChild(ind);
-        closingRow.appendChild(sp);
-        closingRow.appendChild(renderCloseTag(node));
-        wrap.appendChild(closingRow);
-
+    const load = send('GET_TREE_CHILDREN', { selector: node.selector })
+      .then((r) => {
+        // Skip if the node was collapsed (or re-rendered) while fetching.
+        if (!container.isConnected) return;
+        for (const c of r?.nodes || []) container.appendChild(renderTreeNode(c, depth + 1));
         annotateTreeWithChanges();
         highlightTreeSelection();
-      })().finally(() => _childLoads.delete(key));
-      _childLoads.set(key, load);
-      await load;
+      })
+      .finally(() => {
+        if (_childLoads.get(key) === load) _childLoads.delete(key);
+      });
+    _childLoads.set(key, load);
+    return load;
+  }
+
+  /** Select a node from the panel side (tree row, breadcrumb, change row). */
+  async function selectNode(node) {
+    state.selected = node.selector;
+    highlightTreeSelection();
+    // On success the page answers with ELEMENT_SELECTED, which loads the rest.
+    const r = await send('SELECT', { selector: node.selector });
+    if (!r?.ok) loadElementInfo(); // renders the "couldn't resolve" state
+  }
+
+  /** Expand or collapse a node. Resolves once its children are rendered. */
+  async function toggleNode(node, wrap) {
+    const key = selKey(node.selector);
+    const row = wrap.querySelector(':scope > .tree-row');
+    const toggle = row.querySelector('.tree-toggle');
+    const expand = toggle.classList.contains('collapsed');
+    toggle.classList.toggle('expanded', expand);
+    toggle.classList.toggle('collapsed', !expand);
+    const marker = row.querySelector('.tree-modified-marker');
+
+    if (expand) {
+      state.tree.expanded.add(key);
+      row.querySelector('.tree-close-tag').remove();
+      await renderChildren(node, wrap);
+    } else {
+      state.tree.expanded.delete(key);
+      wrap.querySelector(':scope > .tree-children').remove();
+      wrap.querySelector(':scope > .tree-close-row').remove();
+      marker.before(renderCloseTag(node, true));
     }
   }
 
   function renderOpenTag(node) {
     const span = document.createElement('span');
     let html = `<span class="tree-open">&lt;</span><span class="tree-tag">${node.tag}</span>`;
-    const attrs = node.attrs && node.attrs.length
-      ? node.attrs
-      : [
-          ...(node.id ? [{ name: 'id', value: node.id }] : []),
-          ...(node.classes && node.classes.length ? [{ name: 'class', value: node.classes.join(' ') }] : []),
-        ];
-    for (const a of attrs) {
+    for (const a of node.attrs) {
       html += ` <span class="tree-attr-name">${escapeHtml(a.name)}</span>`;
       if (a.value !== '' || a.name === 'class' || a.name === 'id') {
         html += `=<span class="tree-attr-value">"${escapeHtml(truncate(a.value, 50))}"</span>`;
@@ -440,9 +376,13 @@
     return span;
   }
 
-  function renderCloseTag(node) {
+  /** `</tag>`, preceded by an ellipsis when it stands in for hidden children. */
+  function renderCloseTag(node, withEllipsis) {
     const span = document.createElement('span');
-    span.innerHTML = `<span class="tree-close">&lt;/</span><span class="tree-tag">${node.tag}</span><span class="tree-close">&gt;</span>`;
+    span.className = 'tree-close-tag';
+    span.innerHTML =
+      (withEllipsis ? '<span class="tree-close">…</span>' : '') +
+      `<span class="tree-close">&lt;/</span><span class="tree-tag">${node.tag}</span><span class="tree-close">&gt;</span>`;
     return span;
   }
 
@@ -557,80 +497,29 @@
 
   // ─── Tree helpers ───────────────────────────────────────────────────────
 
-  function highlightTreeSelection() {
-    document.querySelectorAll('.tree-row.selected').forEach((r) => r.classList.remove('selected'));
-    if (!state.selected) return;
-    const key = selKey(state.selected);
-    document.querySelectorAll('.tree-row[data-selector-key]').forEach((row) => {
-      if (row.dataset.selectorKey === key && !row.classList.contains('tree-close-row')) {
-        row.classList.add('selected');
-      }
-    });
-  }
-
-  function findTreeNodeWrap(key) {
-    let found = null;
-    document.querySelectorAll('.tree-node[data-selector-key]').forEach((w) => {
-      if (w.dataset.selectorKey === key) found = w;
-    });
-    return found;
-  }
-
   function findTreeRow(key) {
-    let found = null;
-    document.querySelectorAll('.tree-row[data-selector-key]').forEach((r) => {
-      if (r.dataset.selectorKey === key && !r.classList.contains('tree-close-row')) found = r;
-    });
-    return found;
+    return document.querySelector(`#tree .tree-row[data-selector-key="${CSS.escape(key)}"]`);
   }
 
-  async function expandTreeNode(node) {
-    const key = selKey(node.selector);
-    // If this node's children are being fetched (e.g. renderTree after cache
-    // invalidation), wait — otherwise the reveal walk stops mid-way because
-    // the next ancestor's row isn't in the DOM yet.
-    const pending = _childLoads.get(key);
-    if (pending) await pending;
-    const wrap = findTreeNodeWrap(key);
-    if (!wrap) return false;
-    const toggle = wrap.querySelector(':scope > .tree-row > .tree-toggle');
-    if (!toggle || !toggle.classList.contains('has-children')) return false;
-    if (toggle.classList.contains('expanded')) {
-      const stillPending = _childLoads.get(key);
-      if (stillPending) await stillPending;
-      return true;
-    }
-    const indent = wrap.querySelector(':scope > .tree-row > .tree-indent');
-    const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
-    await toggleNode(node, wrap, toggle, depth);
-    return true;
+  function highlightTreeSelection() {
+    document.querySelector('#tree .tree-row.selected')?.classList.remove('selected');
+    if (state.selected) findTreeRow(selKey(state.selected))?.classList.add('selected');
   }
 
-  async function revealInTree(selector, { scroll = true } = {}) {
-    if (!selector) return;
-    const r = await send('GET_TREE_ANCESTORS', { selector });
-    const ancestors = r?.ancestors || [];
-    state.ancestors = ancestors;
-    renderBreadcrumbs();
-    for (const anc of ancestors) {
-      await expandTreeNode(anc);
-    }
-    highlightTreeSelection();
-    if (scroll) {
-      const row = findTreeRow(selKey(selector));
-      if (row) row.scrollIntoView({ block: 'center' });
-    }
-  }
-
-  async function loadBreadcrumbs() {
-    if (!state.selected) {
-      state.ancestors = [];
-      renderBreadcrumbs();
-      return;
-    }
-    const r = await send('GET_TREE_ANCESTORS', { selector: state.selected });
+  /** Expand the tree down to `selector`, refresh breadcrumbs, and scroll to it. */
+  async function revealInTree(selector) {
+    const r = selector ? await send('GET_TREE_ANCESTORS', { selector }) : null;
     state.ancestors = r?.ancestors || [];
     renderBreadcrumbs();
+    for (const anc of state.ancestors) {
+      const key = selKey(anc.selector);
+      await _childLoads.get(key); // children may still be loading after a refresh
+      const row = findTreeRow(key);
+      if (!row) break;
+      if (row.querySelector('.tree-toggle.collapsed')) await toggleNode(anc, row.parentElement);
+    }
+    highlightTreeSelection();
+    if (selector) findTreeRow(selKey(selector))?.scrollIntoView({ block: 'nearest' });
   }
 
   function crumbLabel(node) {
@@ -670,20 +559,15 @@
     bar.scrollLeft = bar.scrollWidth;
   }
 
+  /** Mark tree rows whose element has saved edits. */
   function annotateTreeWithChanges() {
-    document.querySelectorAll('.tree-modified-marker').forEach((m) => (m.innerHTML = ''));
-    const sels = new Set(state.changes.map((c) => c.selector));
-    for (const sel of sels) {
-      document.querySelectorAll('.tree-row[data-selector-key]').forEach((row) => {
-        const parsed = parseSelKey(row.dataset.selectorKey);
-        if (parsed && parsed.value === sel) {
-          const marker = row.querySelector('.tree-modified-marker');
-          if (marker && !marker.innerHTML) {
-            marker.innerHTML = '<span class="tree-modified-dot" title="Has saved edits"></span>';
-          }
-        }
-      });
-    }
+    const edited = new Set(state.changes.map((c) => c.selector));
+    document.querySelectorAll('#tree .tree-row[data-selector-key]').forEach((row) => {
+      const selector = state.tree.nodesBySelector.get(row.dataset.selectorKey)?.selector.value;
+      row.querySelector('.tree-modified-marker').innerHTML = edited.has(selector)
+        ? '<span class="tree-modified-dot" title="Has saved edits"></span>'
+        : '';
+    });
   }
 
   // ─── DOM control actions ────────────────────────────────────────────────
@@ -696,13 +580,7 @@
       setStatus(`Delete failed: ${r.error || 'element not found'}`);
       return;
     }
-    if (state.selected && selKey(state.selected) === selKey(target)) {
-      state.selected = null;
-      state.selectedInfo = null;
-      renderStyles();
-      renderComputed();
-      renderBox();
-    }
+    if (state.selected && selKey(state.selected) === selKey(target)) state.selected = null;
     await refreshAfterMutation();
     setStatus('Element deleted (undo with ⌘Z)');
   }
@@ -737,8 +615,7 @@
       });
       setStatus('Element hidden (H to show)');
     }
-    await loadChanges();
-    if (state.selected) await loadElementInfo();
+    await refreshStyles();
   }
 
   // ─── Context menu ───────────────────────────────────────────────────────
@@ -806,120 +683,69 @@
 
   // ─── Tree keyboard navigation ───────────────────────────────────────────
 
-  function visibleTreeRows() {
-    return Array.from(document.querySelectorAll('#tree .tree-row:not(.tree-close-row)'));
-  }
-
   function nodeForRow(row) {
-    return state.tree.nodesBySelector.get(row.dataset.selectorKey) || null;
+    return state.tree.nodesBySelector.get(row.dataset.selectorKey);
   }
 
   document.getElementById('tree').addEventListener('keydown', async (e) => {
-    if (e.target.closest('.tree-edit-wrap')) return; // inline editor owns keys
-    const rows = visibleTreeRows();
+    if (e.target.closest('.tree-edit-wrap')) return; // the inline editor owns its keys
+    const rows = Array.from(document.querySelectorAll('#tree .tree-row[data-selector-key]'));
     if (!rows.length) return;
-    const selectedKey = state.selected ? selKey(state.selected) : null;
-    let idx = rows.findIndex((r) => r.dataset.selectorKey === selectedKey);
-
-    const selectRowAt = (i) => {
-      const row = rows[Math.max(0, Math.min(rows.length - 1, i))];
-      const node = nodeForRow(row);
-      if (node) {
-        selectNode(node);
-        row.scrollIntoView({ block: 'nearest' });
-      }
-    };
+    const idx = state.selected ? rows.indexOf(findTreeRow(selKey(state.selected))) : -1;
+    const row = rows[idx];
+    const selectRowAt = (i) => selectNode(nodeForRow(rows[Math.max(0, Math.min(rows.length - 1, i))]));
+    const toggleIs = (cls) => row?.querySelector(`.tree-toggle.${cls}`);
 
     switch (e.key) {
       case 'ArrowDown':
-        e.preventDefault();
-        selectRowAt(idx < 0 ? 0 : idx + 1);
+        selectRowAt(idx + 1);
         break;
       case 'ArrowUp':
-        e.preventDefault();
-        selectRowAt(idx < 0 ? 0 : idx - 1);
+        selectRowAt(idx - 1);
         break;
-      case 'ArrowRight': {
-        e.preventDefault();
-        if (idx < 0) return;
-        const row = rows[idx];
-        const node = nodeForRow(row);
-        const toggle = row.querySelector('.tree-toggle');
-        if (node && toggle?.classList.contains('collapsed')) {
-          const wrap = row.closest('.tree-node');
-          const indent = row.querySelector('.tree-indent');
-          const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
-          await toggleNode(node, wrap, toggle, depth);
-        } else {
-          selectRowAt(idx + 1);
-        }
+      case 'ArrowRight':
+        if (toggleIs('collapsed')) await toggleNode(nodeForRow(row), row.parentElement);
+        else if (row) selectRowAt(idx + 1);
         break;
-      }
       case 'ArrowLeft': {
-        e.preventDefault();
-        if (idx < 0) return;
-        const row = rows[idx];
-        const node = nodeForRow(row);
-        const toggle = row.querySelector('.tree-toggle');
-        if (node && toggle?.classList.contains('expanded')) {
-          const wrap = row.closest('.tree-node');
-          const indent = row.querySelector('.tree-indent');
-          const depth = indent ? Math.round(parseInt(indent.style.width || '0', 10) / 12) : 0;
-          await toggleNode(node, wrap, toggle, depth);
-        } else {
-          // Move to parent row.
-          const wrap = row.closest('.tree-node');
-          const parentWrap = wrap?.parentElement?.closest('.tree-node');
-          if (parentWrap) {
-            const parentRow = parentWrap.querySelector(':scope > .tree-row');
-            const parentNode = nodeForRow(parentRow);
-            if (parentNode) selectNode(parentNode);
-          }
+        if (toggleIs('expanded')) {
+          await toggleNode(nodeForRow(row), row.parentElement);
+          break;
         }
+        const parentRow = row?.parentElement.parentElement.closest('.tree-node')?.querySelector(':scope > .tree-row');
+        if (parentRow) selectNode(nodeForRow(parentRow));
         break;
       }
       case 'Delete':
       case 'Backspace':
-        e.preventDefault();
         if (state.selected) deleteSelectedElement(state.selected);
         break;
       case 'h':
       case 'H':
-        e.preventDefault();
         if (state.selected) toggleHideElement(state.selected);
         break;
       case 'F2':
-      case 'Enter': {
-        e.preventDefault();
-        if (idx < 0) return;
-        const row = rows[idx];
-        const node = nodeForRow(row);
-        if (node) startInlineHtmlEdit(node, row);
+      case 'Enter':
+        if (row) startInlineHtmlEdit(nodeForRow(row), row);
         break;
-      }
+      default:
+        return; // not ours — leave the event alone
     }
+    e.preventDefault();
   });
 
   // ─── Selected element info ──────────────────────────────────────────────
 
   async function loadElementInfo() {
-    if (!state.selected) {
-      state.selectedInfo = null;
-      renderStyles();
-      renderComputed();
-      renderBox();
-      renderBreadcrumbs();
-      return;
-    }
-    setStatus(state.selected.value);
-    // Token guard: GET_ELEMENT_INFO latency varies wildly (cross-origin CSS
-    // fetch vs instant null). A stale slow response must not clobber the
-    // info for a newer selection.
+    // GET_ELEMENT_INFO latency varies wildly (cross-origin CSS fetch vs an
+    // instant null), so a stale response must not clobber a newer selection.
     const token = ++_infoToken;
-    const requestedKey = selKey(state.selected);
-    const info = await send('GET_ELEMENT_INFO', { selector: state.selected });
-    if (token !== _infoToken) return;
-    if (!state.selected || selKey(state.selected) !== requestedKey) return;
+    let info = null;
+    if (state.selected) {
+      setStatus(state.selected.value);
+      info = await send('GET_ELEMENT_INFO', { selector: state.selected });
+      if (token !== _infoToken) return;
+    }
     state.selectedInfo = info;
     renderStyles();
     renderComputed();
@@ -997,7 +823,6 @@
     // element.style.
     const authorRules = [];
     for (const r of info.matched) {
-      if (r.origin === 'desinspect') continue;
       authorRules.push({
         kind: 'rule',
         selector: r.selector,
@@ -1215,7 +1040,7 @@
           payload: { selector: selectorFor(rule), property: oldName, value: p.value, disabled: true, elementLabel: state.selected?.value },
         });
       }
-      await saveStyleEdit(rule, newName, p.value, false);
+      await saveStyleEdit(rule, newName, p.value);
     };
     const onKey = (e) => {
       if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
@@ -1258,7 +1083,7 @@
       cleanup();
       const newVal = (span.textContent || '').trim();
       if (newVal === oldVal) return;
-      saveStyleEdit(rule, p.name, newVal, false);
+      saveStyleEdit(rule, p.name, newVal);
     };
     const cancel = async () => {
       if (finished) return;
@@ -1279,8 +1104,7 @@
       } else {
         await send('REVERT_PROP', { selector: rule.targetSelector, property: p.name });
       }
-      await loadChanges();
-      await loadElementInfo();
+      await refreshStyles();
     };
     const live = () => {
       const v = (span.textContent || '').trim();
@@ -1373,7 +1197,7 @@
       const n = nameIn.value.trim().toLowerCase();
       const v = valIn.value.trim();
       if (!n || !v) { row.remove(); return; }
-      saveStyleEdit(rule, n, v, false);
+      saveStyleEdit(rule, n, v);
     };
     const cancel = () => { committed = true; row.remove(); };
 
@@ -1458,17 +1282,12 @@
     add.addEventListener('click', () => startAddProperty(add, ruleRef));
   }
 
-  async function saveStyleEdit(rule, property, value, isDelete) {
+  async function saveStyleEdit(rule, property, value) {
     if (!state.selected) return;
-    if (isDelete) {
-      await send('REVERT_PROP', { selector: rule.targetSelector, property });
-    } else {
-      await send('APPLY_STYLE', {
-        payload: { selector: selectorFor(rule), property, value, elementLabel: state.selected.value },
-      });
-    }
-    await loadElementInfo();
-    await loadChanges();
+    await send('APPLY_STYLE', {
+      payload: { selector: selectorFor(rule), property, value, elementLabel: state.selected.value },
+    });
+    await refreshStyles();
   }
 
   /**
@@ -1506,8 +1325,7 @@
         },
       });
     }
-    await loadElementInfo();
-    await loadChanges();
+    await refreshStyles();
   }
 
   function makeColorSwatch(value) {
@@ -1535,7 +1353,7 @@
       });
     });
     input.addEventListener('change', () => {
-      saveStyleEdit(rule, p.name, input.value, false);
+      saveStyleEdit(rule, p.name, input.value);
       input.remove();
     });
   }
@@ -1720,12 +1538,9 @@
       sel.className = 'change-selector';
       sel.textContent = c.selector;
       sel.title = 'Click to select this element';
-      sel.addEventListener('click', async () => {
-        state.selected = { type: c.selectorType || 'css', value: c.selector };
-        await send('SELECT', { selector: state.selected });
-        await loadElementInfo();
-        await revealInTree(state.selected);
-      });
+      sel.addEventListener('click', () =>
+        selectNode({ selector: { type: c.selectorType || 'css', value: c.selector } })
+      );
       head.appendChild(sel);
 
       const actions = document.createElement('div');
@@ -1867,7 +1682,6 @@
       document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
       tab.classList.add('active');
       const name = tab.dataset.tab;
-      state.activeTab = name;
       document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.panel === name));
       if (name === 'snapshots') loadSnapshots();
     });
@@ -1908,12 +1722,6 @@
   function selKey(selector) {
     if (!selector) return 'null';
     return `${selector.type}:${selector.value}`;
-  }
-  function parseSelKey(key) {
-    if (!key) return null;
-    const i = key.indexOf(':');
-    if (i < 0) return null;
-    return { type: key.slice(0, i), value: key.slice(i + 1) };
   }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

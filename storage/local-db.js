@@ -41,9 +41,18 @@ const PersistDB = (() => {
     return _dbPromise;
   }
 
-  /** Cached DB handle, or null if open() hasn't resolved yet. */
-  function dbSync() {
-    return _dbInstance;
+  /**
+   * Fire-and-forget write that starts its transaction synchronously (for
+   * unload handlers). Needs the DB to be open already; no-op otherwise.
+   */
+  function putChangesSync(records) {
+    if (!_dbInstance) return;
+    try {
+      const store = _dbInstance.transaction(STORE_CHANGES, 'readwrite').objectStore(STORE_CHANGES);
+      for (const r of records) store.put(r);
+    } catch (err) {
+      console.warn('[DesInspect] unload flush failed:', err);
+    }
   }
 
   function normalizeUrl(url) {
@@ -126,7 +135,7 @@ const PersistDB = (() => {
       store.add({
         urlPattern,
         name: name || `Snapshot ${new Date().toLocaleString()}`,
-        changes: JSON.parse(JSON.stringify(changes)),
+        changes,
         timestamp: Date.now(),
       })
     );
@@ -147,7 +156,7 @@ const PersistDB = (() => {
 
   return {
     open,
-    dbSync,
+    putChangesSync,
     normalizeUrl,
     putChange,
     deleteChange,

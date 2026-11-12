@@ -15,8 +15,8 @@ const Persistence = (() => {
   const DEBOUNCE_MS = 300;
   const STYLESHEET_ID = 'desinspect-overrides';
   let _currentUrl = location.href;
-  let _saveTimers = new Map(); // id → { t: timeoutId, record } — record kept so flush works even if _cache was rebuilt
-  let _cache = new Map(); // id → record (in-memory mirror of IDB for this URL)
+  const _saveTimers = new Map(); // id → { t: timeoutId, record } — record kept so flush works even if _cache was rebuilt
+  const _cache = new Map(); // id → record (in-memory mirror of IDB for this URL)
 
   // Which __remove__ records have already been applied this page generation.
   // Without this, positional selectors (li:nth-of-type(2)) would match a NEW
@@ -46,14 +46,7 @@ const Persistence = (() => {
 
   function isNoopOp(op) {
     if (!op.before && !op.after) return true;
-    if (op.before && op.after) {
-      try {
-        return JSON.stringify(op.before) === JSON.stringify(op.after);
-      } catch {
-        return false;
-      }
-    }
-    return false;
+    return !!op.before && !!op.after && JSON.stringify(op.before) === JSON.stringify(op.after);
   }
 
   function pushHistory(label, ops) {
@@ -95,14 +88,23 @@ const Persistence = (() => {
     });
   }
 
-  async function applyOpDirection(op, useBefore) {
-    // Cancel any pending debounced save for this id — otherwise its timer
-    // fires after the rollback and resurrects the undone value in IDB.
-    const pending = _saveTimers.get(op.id);
+  /** Cancel a pending debounced save so its timer can't resurrect a record. */
+  function cancelTimer(id) {
+    const pending = _saveTimers.get(id);
     if (pending) {
       clearTimeout(pending.t);
-      _saveTimers.delete(op.id);
+      _saveTimers.delete(id);
     }
+  }
+
+  const isStructural = (record) =>
+    record.property === '__html__' || record.property === '__remove__';
+
+  const REVERT_FAILED_REASON =
+    'Element could not be restored (page may have re-rendered). The change record was kept.';
+
+  async function applyOpDirection(op, useBefore) {
+    cancelTimer(op.id);
     const target = useBefore ? op.before : op.after;
     const other = useBefore ? op.after : op.before;
     if (target) {
@@ -114,11 +116,8 @@ const Persistence = (() => {
       // a failed structural unapply means the record still holds the only
       // copy of the original markup — keep it rather than orphaning the DOM.
       const ok = unapplyRecord(other);
-      if (!ok && (other.property === '__html__' || other.property === '__remove__')) {
-        notifyPanel('REVERT_FAILED', {
-          id: op.id,
-          reason: 'Element could not be restored (page may have re-rendered). The change record was kept.',
-        });
+      if (!ok && isStructural(other)) {
+        notifyPanel('REVERT_FAILED', { id: op.id, reason: REVERT_FAILED_REASON });
         return;
       }
       _cache.delete(op.id);
@@ -177,7 +176,7 @@ const Persistence = (() => {
     return `${selector}::${property}`;
   }
 
-  function deleteTrackedRule(selector, property) {
+  function removeRuleFromSheet(selector, property) {
     const sheet = getStylesheet();
     const key = sheetRuleKey(selector, property);
     const tracked = _sheetRules.get(key);
@@ -200,17 +199,13 @@ const Persistence = (() => {
     const value = record.disabled ? 'revert' : record.value;
     const cssText = `${ruleSelector} { ${record.property}: ${value} !important; }`;
 
-    deleteTrackedRule(ruleSelector, record.property);
+    removeRuleFromSheet(ruleSelector, record.property);
     try {
       const idx = sheet.insertRule(cssText, sheet.cssRules.length);
       _sheetRules.set(sheetRuleKey(ruleSelector, record.property), sheet.cssRules[idx]);
     } catch (err) {
       console.warn('[DesInspect] insertRule failed:', cssText, err);
     }
-  }
-
-  function removeRuleFromSheet(selector, property) {
-    deleteTrackedRule(selector, property);
   }
 
   function wipeSheet() {
@@ -221,19 +216,23 @@ const Persistence = (() => {
 
   // ─── Record application ────────────────────────────────────────────────────
 
-  function liveNodes(record) {
-    const nodes = _liveEls.get(record.id);
+  function liveNodes(id) {
+    const nodes = _liveEls.get(id);
     if (nodes && nodes.length && nodes.every((n) => n.isConnected)) return nodes;
     return null;
   }
 
+  /** First live element root a record owns, or null. */
+  function getLiveElement(id) {
+    const nodes = liveNodes(id);
+    return (nodes && nodes.find((n) => n.nodeType === 1)) || null;
+  }
+
   function findLive(record) {
-    const nodes = liveNodes(record);
-    if (nodes) {
-      const firstEl = nodes.find((n) => n.nodeType === 1);
-      if (firstEl) return firstEl;
-    }
-    return SelectorEngine.find({ type: record.selectorType, value: record.selector });
+    return (
+      getLiveElement(record.id) ||
+      SelectorEngine.find({ type: record.selectorType, value: record.selector })
+    );
   }
 
   function parseTemplate(html) {
@@ -248,11 +247,7 @@ const Persistence = (() => {
    * boolean attributes, tag case all normalize).
    */
   function normalizeHtml(html) {
-    const tmpl = document.createElement('template');
-    tmpl.innerHTML = html;
-    const div = document.createElement('div');
-    div.appendChild(tmpl.content.cloneNode(true));
-    return div.innerHTML;
+    return serializeNodes(parseTemplate(html).childNodes);
   }
 
   function serializeNodes(nodes) {
@@ -304,7 +299,7 @@ const Persistence = (() => {
   }
 
   function applyHtmlChange(record) {
-    const tracked = liveNodes(record);
+    const tracked = liveNodes(record.id);
     // Idempotence: silent reapplies (MutationObserver settles) must not
     // re-replace an already-applied subtree — that would reset focus and
     // listeners on every unrelated SPA re-render. Compare canonical
@@ -324,7 +319,7 @@ const Persistence = (() => {
 
   function unapplyHtmlChange(record) {
     if (record.originalValue == null) return false;
-    const tracked = liveNodes(record);
+    const tracked = liveNodes(record.id);
     const el = findLive(record);
     if (!el) return false;
     markOurMutation();
@@ -386,13 +381,7 @@ const Persistence = (() => {
     if (record.property === '__remove__') return unapplyRemoveChange(record);
     if (record.selectorType === 'xpath') {
       const el = SelectorEngine.find({ type: 'xpath', value: record.selector });
-      if (el) {
-        if (record.inlinePrior) {
-          el.style.setProperty(record.property, record.inlinePrior);
-        } else {
-          el.style.removeProperty(record.property);
-        }
-      }
+      if (el) restoreInlinePrior(el, record);
       return !!el;
     }
     removeRuleFromSheet(record.selector, record.property);
@@ -408,16 +397,17 @@ const Persistence = (() => {
     if (record.inlinePrior === undefined) {
       record.inlinePrior = el.style.getPropertyValue(record.property) || '';
     }
-    if (record.disabled || record.value === '' || record.value == null) {
-      if (record.inlinePrior) {
-        el.style.setProperty(record.property, record.inlinePrior);
-      } else {
-        el.style.removeProperty(record.property);
-      }
+    if (record.disabled || !record.value) {
+      restoreInlinePrior(el, record);
     } else {
       el.style.setProperty(record.property, record.value, 'important');
     }
     return true;
+  }
+
+  function restoreInlinePrior(el, record) {
+    if (record.inlinePrior) el.style.setProperty(record.property, record.inlinePrior);
+    else el.style.removeProperty(record.property);
   }
 
   // ─── Init / reapply ────────────────────────────────────────────────────────
@@ -425,8 +415,8 @@ const Persistence = (() => {
   /**
    * Handle a (possible) URL change. Content scripts run in an isolated
    * world, so patching history.pushState never sees the page's own SPA
-   * navigations — detection is: popstate, a URL poll, the MutationObserver
-   * callback, and URL_CHANGED pushes from the service worker.
+   * navigations — instead we poll location.href (and check it whenever
+   * the DOM changes). Returns true when the URL pattern actually changed.
    */
   function handleNavigation() {
     const newUrl = location.href;
@@ -442,9 +432,8 @@ const Persistence = (() => {
     _undoStack = [];
     _redoStack = [];
     broadcastUndoState();
-    // Wait for SPA frameworks to finish their re-render.
-    setTimeout(() => reapply(), 50);
-    setTimeout(() => reapply(), 300);
+    // The MutationObserver re-applies again once the SPA's render settles.
+    reapply();
     return true;
   }
 
@@ -453,8 +442,6 @@ const Persistence = (() => {
     _currentUrl = location.href;
     await reapply();
 
-    window.addEventListener('popstate', handleNavigation);
-    // URL poll: cheap, catches pushState/replaceState from the page world.
     setInterval(handleNavigation, 500);
 
     // Re-apply after SPA DOM churn settles — but ignore our own mutations.
@@ -483,43 +470,30 @@ const Persistence = (() => {
     });
   }
 
-  /**
-   * Write all pending records NOW. Uses a synchronous transaction on the
-   * cached DB handle so the write starts inside the pagehide handler (an
-   * awaited open() would only run after the handler returns, when the
-   * page may already be tearing down).
-   */
-  function flushPendingSaves() {
-    if (!_saveTimers.size) return;
+  /** Cancel every pending save timer and return the records they held. */
+  function takePendingRecords() {
     const records = [];
-    for (const [, entry] of _saveTimers.entries()) {
+    for (const entry of _saveTimers.values()) {
       clearTimeout(entry.t);
-      if (entry.record) records.push(entry.record);
+      records.push(entry.record);
     }
     _saveTimers.clear();
-    const db = PersistDB.dbSync?.();
-    if (db) {
-      try {
-        const tx = db.transaction('changes', 'readwrite');
-        const store = tx.objectStore('changes');
-        for (const r of records) store.put(r);
-        return;
-      } catch {
-        /* fall through to async path */
-      }
-    }
-    for (const r of records) PersistDB.putChange(r).catch(() => {});
+    return records;
   }
 
-  /** Awaited flush for snapshot creation and other must-be-durable moments. */
+  /**
+   * Write pending records as the page is being left. PersistDB.putChangesSync
+   * starts the transaction synchronously — an awaited write would only begin
+   * after the pagehide handler returns, when the page may be tearing down.
+   */
+  function flushPendingSaves() {
+    const records = takePendingRecords();
+    if (records.length) PersistDB.putChangesSync(records);
+  }
+
+  /** Awaited flush, for moments that must be durable (snapshot creation). */
   async function flushNow() {
-    const records = [];
-    for (const [, entry] of _saveTimers.entries()) {
-      clearTimeout(entry.t);
-      if (entry.record) records.push(entry.record);
-    }
-    _saveTimers.clear();
-    await Promise.all(records.map((r) => PersistDB.putChange(r).catch(() => {})));
+    await Promise.all(takePendingRecords().map((r) => PersistDB.putChange(r)));
   }
 
   function debounce(fn, ms, maxWait) {
@@ -564,15 +538,10 @@ const Persistence = (() => {
       // timers (their IDB write is still debounced) — a blind clear would
       // evict them and the flush path would lose them entirely. Overlay
       // pending records on top of the fetched snapshot.
-      const pending = new Map();
-      for (const [id, entry] of _saveTimers.entries()) {
-        if (entry.record) pending.set(id, entry.record);
-      }
+      const byId = new Map(records.map((r) => [r.id, r]));
+      for (const [id, entry] of _saveTimers) byId.set(id, entry.record);
       _cache.clear();
       wipeSheet();
-
-      const byId = new Map(records.map((r) => [r.id, r]));
-      for (const [id, r] of pending.entries()) byId.set(id, r);
 
       for (const r of orderRecords(Array.from(byId.values()))) {
         _cache.set(r.id, r);
@@ -592,10 +561,8 @@ const Persistence = (() => {
    * Save and apply. CSS edits debounce their IDB write (they fire per
    * keystroke); structural edits (__html__/__remove__) are awaited so the
    * caller only resolves once the change is durable.
-   *
-   * opts.recordHistory=false lets undo/redo replay without re-recording.
    */
-  async function saveChange(input, opts = {}) {
+  async function saveChange(input) {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
     const id = input.id || `${urlPattern}::${input.selector}::${input.property}`;
     const before = _cache.get(id) || null;
@@ -614,20 +581,12 @@ const Persistence = (() => {
     _cache.set(id, record);
     applyRecord(record);
 
-    if (opts.recordHistory !== false) {
-      pushHistory(historyLabel(record), [
-        { id, before: before ? { ...before } : null, after: { ...record } },
-      ]);
-    }
+    pushHistory(historyLabel(record), [
+      { id, before: before ? { ...before } : null, after: { ...record } },
+    ]);
 
-    const flushImmediately =
-      input.property === '__html__' || input.property === '__remove__';
-    const prior = _saveTimers.get(id);
-    if (prior) {
-      clearTimeout(prior.t);
-      _saveTimers.delete(id);
-    }
-    if (flushImmediately) {
+    cancelTimer(id);
+    if (isStructural(record)) {
       await PersistDB.putChange(record);
       notifyPanel('CHANGE_SAVED', { id });
       return record;
@@ -652,13 +611,8 @@ const Persistence = (() => {
     return `${record.property}: ${record.disabled ? '(off)' : record.value}`;
   }
 
-  async function deleteChange(id, opts = {}) {
-    // Cancel any in-flight debounced save so it can't resurrect the record.
-    const pending = _saveTimers.get(id);
-    if (pending) {
-      clearTimeout(pending.t);
-      _saveTimers.delete(id);
-    }
+  async function deleteChange(id) {
+    cancelTimer(id);
     const record = _cache.get(id) || (await PersistDB.getChange(id));
     if (!record) return { ok: true };
 
@@ -666,20 +620,15 @@ const Persistence = (() => {
     // A structural record whose unapply failed holds the ONLY copy of the
     // original markup/position — deleting it would strand the DOM in the
     // edited state with no way back. Keep the record and tell the panel.
-    if (!unapplied && (record.property === '__html__' || record.property === '__remove__')) {
-      notifyPanel('REVERT_FAILED', {
-        id,
-        reason: 'Element could not be restored (page may have re-rendered). The change record was kept.',
-      });
+    if (!unapplied && isStructural(record)) {
+      notifyPanel('REVERT_FAILED', { id, reason: REVERT_FAILED_REASON });
       return { ok: false, error: 'unapply failed; record kept' };
     }
 
     _cache.delete(id);
     await PersistDB.deleteChange(id);
 
-    if (opts.recordHistory !== false) {
-      pushHistory(`Revert ${record.property}`, [{ id, before: { ...record }, after: null }]);
-    }
+    pushHistory(`Revert ${record.property}`, [{ id, before: { ...record }, after: null }]);
     notifyPanel('CHANGE_DELETED', { id });
     return { ok: true };
   }
@@ -688,15 +637,9 @@ const Persistence = (() => {
    * Delete by (selector, property) — used by the panel when it doesn't have
    * a record id (e.g. cancelling a live-preview edit that created one).
    */
-  async function deleteChangeByProp(selector, property, opts = {}) {
+  function deleteChangeByProp(selector, property) {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
-    const id = `${urlPattern}::${selector}::${property}`;
-    return deleteChange(id, opts);
-  }
-
-  function cancelAllTimers() {
-    for (const entry of _saveTimers.values()) clearTimeout(entry.t);
-    _saveTimers.clear();
+    return deleteChange(`${urlPattern}::${selector}::${property}`);
   }
 
   /**
@@ -706,19 +649,13 @@ const Persistence = (() => {
    */
   function unapplyAllRecords(records) {
     for (const r of orderRecords(records).reverse()) {
-      if (
-        r.property === '__html__' ||
-        r.property === '__remove__' ||
-        r.selectorType === 'xpath'
-      ) {
-        unapplyRecord(r);
-      }
+      if (isStructural(r) || r.selectorType === 'xpath') unapplyRecord(r);
     }
     wipeSheet();
   }
 
   async function clearAll() {
-    cancelAllTimers();
+    takePendingRecords();
     // Ops in apply order so undo (which replays them reversed) restores
     // removals first, then HTML newest-first, then CSS.
     const records = orderRecords(Array.from(_cache.values()));
@@ -733,7 +670,7 @@ const Persistence = (() => {
   }
 
   async function restoreSnapshot(snapshotChanges) {
-    cancelAllTimers();
+    takePendingRecords();
     const current = orderRecords(Array.from(_cache.values()));
     const ops = [];
     for (const r of current) ops.push({ id: r.id, before: { ...r }, after: null });
@@ -766,13 +703,6 @@ const Persistence = (() => {
     chrome.runtime.sendMessage({ type, data }).catch(() => {});
   }
 
-  function getLiveElement(id) {
-    const nodes = _liveEls.get(id);
-    if (!nodes || !nodes.length) return null;
-    const firstEl = nodes.find((n) => n.nodeType === 1);
-    return firstEl && firstEl.isConnected ? firstEl : null;
-  }
-
   return {
     init,
     saveChange,
@@ -780,13 +710,11 @@ const Persistence = (() => {
     deleteChangeByProp,
     clearAll,
     restoreSnapshot,
-    reapply,
     getCurrentChanges,
     undo,
     redo,
     getUndoState,
     markOurMutation,
-    handleNavigation,
     flushNow,
     getLiveElement,
   };

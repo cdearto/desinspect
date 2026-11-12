@@ -5,9 +5,6 @@
   "description": "Chrome-DevTools-style element inspector with persistent edits. Tweak any page's CSS/HTML and your changes survive refresh, login, and SPA navigation.",
   "minimum_chrome_version": "116",
   "permissions": [
-    "activeTab",
-    "scripting",
-    "storage",
     "sidePanel",
     "webNavigation"
   ],
@@ -32,8 +29,7 @@
         "content/inspector.js"
       ],
       "css": ["styles/content.css"],
-      "run_at": "document_idle",
-      "all_frames": false
+      "run_at": "document_idle"
     }
   ],
   "action": {

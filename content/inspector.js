@@ -9,22 +9,27 @@
 (() => {
   let _pickerActive = false;
   let _selected = null;
-  let _selectedSelector = null;
 
-  const MARKER_CLASS_RE = /desinspect-fs-[a-z-]+/g;
-
-  function stripMarkers(s) {
-    if (!s) return s;
-    return s
-      .replace(/class="([^"]*)"/g, (full, cls) => {
-        const cleaned = cls.replace(MARKER_CLASS_RE, '').replace(/\s+/g, ' ').trim();
-        return cleaned ? `class="${cleaned}"` : '';
-      })
-      .replace(/\s+>/g, '>');
-  }
+  // Forced-state marker classes (see StylesEngine.forceStates) are ours, not
+  // the page's — keep them out of everything we show or save.
+  const MARKER_PREFIX = 'desinspect-fs-';
 
   function cleanClasses(el) {
-    return Array.from(el.classList || []).filter((c) => !c.startsWith('desinspect-fs-'));
+    return Array.from(el.classList).filter((c) => !c.startsWith(MARKER_PREFIX));
+  }
+
+  /** el.outerHTML without our injected nodes or forced-state marker classes. */
+  function cleanOuterHTML(el) {
+    const ours = `[data-desinspect], [class*="${MARKER_PREFIX}"]`;
+    if (!el.matches(ours) && !el.querySelector(ours)) return el.outerHTML;
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('[data-desinspect]').forEach((n) => n.remove());
+    for (const n of [clone, ...clone.querySelectorAll(`[class*="${MARKER_PREFIX}"]`)]) {
+      const classes = cleanClasses(n);
+      if (classes.length) n.className = classes.join(' ');
+      else n.removeAttribute('class');
+    }
+    return clone.outerHTML;
   }
 
   // ─── Picker ────────────────────────────────────────────────────────────────
@@ -85,20 +90,9 @@
     // Any (re-)selection clears forced pseudo-states — the panel resets its
     // :hov checkboxes on every ELEMENT_SELECTED, so the page must match.
     StylesEngine.forceStates(null, []);
-    if (!el) {
-      _selected = null;
-      _selectedSelector = null;
-      Overlay.showSelected(null);
-      notifyPanel('ELEMENT_SELECTED', { selector: null });
-      return;
-    }
     _selected = el;
-    _selectedSelector = SelectorEngine.generate(el);
     Overlay.showSelected(el);
-    notifyPanel('ELEMENT_SELECTED', {
-      selector: _selectedSelector,
-      info: describeElement(el),
-    });
+    notifyPanel('ELEMENT_SELECTED', { selector: el ? SelectorEngine.generate(el) : null });
   }
 
   function describeElement(el) {
@@ -106,16 +100,12 @@
       tag: el.tagName.toLowerCase(),
       id: el.id || null,
       classes: cleanClasses(el),
-      attributes: Array.from(el.attributes || [])
-        .filter((a) => !a.name.startsWith('data-desinspect'))
+      attributes: Array.from(el.attributes)
         .map((a) => ({
           name: a.name,
-          value: a.name === 'class'
-            ? a.value.replace(MARKER_CLASS_RE, '').replace(/\s+/g, ' ').trim()
-            : a.value,
+          value: a.name === 'class' ? cleanClasses(el).join(' ') : a.value,
         }))
         .filter((a) => !(a.name === 'class' && !a.value)),
-      text: (el.textContent || '').trim().slice(0, 120),
     };
   }
 
@@ -170,8 +160,10 @@
 
   // ─── Element info ──────────────────────────────────────────────────────────
 
+  const MAX_HTML_LENGTH = 50000; // larger subtrees aren't offered for Edit as HTML
+
   async function elementInfo(selectorObj) {
-    const el = selectorObj ? SelectorEngine.find(selectorObj) : _selected;
+    const el = SelectorEngine.find(selectorObj);
     if (!el) return null;
 
     // Which persisted CSS-change selectors actually match this element —
@@ -201,8 +193,7 @@
       computed: StylesEngine.computedSnapshot(el),
       box: StylesEngine.boxModel(el),
       matchingChangeSelectors,
-      outerHTML: el.outerHTML.length < 50000 ? stripMarkers(el.outerHTML) : null,
-      innerHTML: el.innerHTML.length < 50000 ? stripMarkers(el.innerHTML) : null,
+      outerHTML: el.outerHTML.length < MAX_HTML_LENGTH ? cleanOuterHTML(el) : null,
     };
   }
 
@@ -249,7 +240,6 @@
       newSelector = SelectorEngine.generate(live);
       if (editedWasSelection) {
         _selected = live;
-        _selectedSelector = newSelector;
         Overlay.showSelected(live);
       }
     }
@@ -266,8 +256,7 @@
    * re-insert it at the same position.
    */
   async function deleteElement(selectorObj) {
-    // Marker classes must not end up in captured outerHTML (they'd diverge
-    // from the stripped record value and confuse the idempotence check).
+    // Clear forced states so marker classes can't end up in the saved HTML.
     await StylesEngine.forceStates(null, []);
     const el = SelectorEngine.find(selectorObj);
     if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
@@ -280,7 +269,7 @@
       selectorType: selectorObj.type,
       property: '__remove__',
       value: '1',
-      originalValue: stripMarkers(el.outerHTML),
+      originalValue: el.outerHTML,
       parentSelector: parentSel.value,
       parentSelectorType: parentSel.type,
       childIndex,
@@ -293,23 +282,20 @@
    * __html__ edit on the parent (its outerHTML captures the duplication).
    */
   async function duplicateElement(selectorObj) {
-    // Clear forced-state marker classes first — capturing parent.outerHTML
-    // with markers present would diverge from the stripped record value and
-    // trigger an immediate destructive parent re-swap.
+    // Clear forced states so marker classes can't end up in the saved HTML.
     await StylesEngine.forceStates(null, []);
     const el = SelectorEngine.find(selectorObj);
     if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
     const parent = el.parentElement;
     const parentSel = SelectorEngine.generate(parent);
-    const before = stripMarkers(parent.outerHTML);
+    const before = parent.outerHTML;
     Persistence.markOurMutation();
-    el.insertAdjacentHTML('afterend', stripMarkers(el.outerHTML));
-    const after = stripMarkers(parent.outerHTML);
+    el.insertAdjacentHTML('afterend', el.outerHTML);
     return Persistence.saveChange({
       selector: parentSel.value,
       selectorType: parentSel.type,
       property: '__html__',
-      value: after,
+      value: parent.outerHTML,
       originalValue: before,
       elementTag: parent.tagName.toLowerCase(),
     });
@@ -336,8 +322,6 @@
 
   async function handleMessage(msg) {
     switch (msg?.type) {
-      case 'PING':
-        return { url: location.href, hasSelection: !!_selected };
       case 'START_PICKER':
         startPicker();
         return { ok: true };
@@ -393,9 +377,6 @@
       case 'REVERT_ALL':
         await Persistence.clearAll();
         return { ok: true };
-      case 'URL_CHANGED':
-        Persistence.handleNavigation();
-        return { ok: true };
       case 'GET_CHANGES':
         return { changes: Persistence.getCurrentChanges() };
       case 'CREATE_SNAPSHOT':
@@ -423,10 +404,4 @@
   // ─── Boot ──────────────────────────────────────────────────────────────────
 
   Persistence.init();
-
-  const ro = new ResizeObserver(() => Overlay.refreshSelected());
-  ro.observe(document.documentElement);
-  setInterval(() => Overlay.refreshSelected(), 1000);
-
-  console.log('[DesInspect] inspector loaded on', location.href);
 })();

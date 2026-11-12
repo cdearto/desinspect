@@ -20,9 +20,7 @@ const SelectorEngine = (() => {
     return VOLATILE_ID_RE.test(id) || /[0-9]{4,}/.test(id) || id.length > 32;
   }
 
-  function escape(s) {
-    return CSS.escape ? CSS.escape(s) : s.replace(/(["\\#.:>+~()[\]^$|*=,])/g, '\\$1');
-  }
+  const escape = (s) => CSS.escape(s);
 
   /**
    * Tag name for CSS: lowercase for HTML-namespace elements, exact case for
@@ -47,7 +45,7 @@ const SelectorEngine = (() => {
     const classes = Array.from(el.classList || [])
       .filter((c) => !isVolatileClass(c))
       .slice(0, 2);
-    let seg = escape(tag) === tag ? tag : escape(tag);
+    let seg = escape(tag);
     if (classes.length) seg += '.' + classes.map(escape).join('.');
 
     const parent = el.parentElement;
@@ -62,7 +60,7 @@ const SelectorEngine = (() => {
         // not among all children.
         const sameTag = Array.from(parent.children).filter((c) => cssTag(c) === tag);
         const idx = sameTag.indexOf(el) + 1;
-        seg = tag + `:nth-of-type(${idx})`;
+        seg = `${escape(tag)}:nth-of-type(${idx})`;
       }
     }
     return seg;
