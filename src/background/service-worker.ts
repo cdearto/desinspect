@@ -12,7 +12,7 @@ chrome.sidePanel
 
 // Content scripts are subject to the page's CORS policy; the service worker
 // can fetch any URL the extension's host_permissions cover.
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type !== 'FETCH_TEXT' || typeof msg.url !== 'string') return false;
   fetch(msg.url, { credentials: 'omit' })
     .then(async (res) => {
@@ -24,11 +24,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // Full loads and SPA (History API) navigations both reach the side panel.
-function notifyUrlChange(details) {
+function notifyUrlChange(details: { frameId: number; tabId: number; url: string }): void {
   if (details.frameId !== 0) return;
-  chrome.runtime
-    .sendMessage({ type: 'URL_CHANGED', url: details.url, tabId: details.tabId })
-    .catch(() => {}); // panel not open
+  const push: PanelPush = { type: 'URL_CHANGED', url: details.url, tabId: details.tabId };
+  chrome.runtime.sendMessage(push).catch(() => {}); // panel not open
 }
 
 chrome.webNavigation.onHistoryStateUpdated.addListener(notifyUrlChange);

@@ -33,11 +33,16 @@ DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools 
 
 ## Install (unpacked)
 
-1. Clone this repo.
-2. Open `chrome://extensions` (Chrome 116+).
-3. Toggle **Developer mode** on.
-4. Click **Load unpacked**, select this directory.
-5. Pin the toolbar icon.
+The extension is written in TypeScript and compiled with plain `tsc` (no bundler).
+
+```bash
+npm install
+npm run build        # type-checks and writes the loadable extension to dist/
+```
+
+Then open `chrome://extensions` (Chrome 116+), turn on **Developer mode**, click **Load unpacked**, and select the `dist/` folder. After changing code, run `npm run build` again and hit the reload icon on the extension card.
+
+`npm run typecheck` checks types without writing files.
 
 ## Keyboard shortcuts
 
@@ -55,18 +60,21 @@ DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools 
 ## Architecture
 
 ```
-manifest.json                  # MV3
-background/service-worker.js   # side panel, sidepanel↔content relay, CORS-exempt CSS fetch
-content/
-  selector.js                  # CSS/XPath selector generation + resolution
-  styles-engine.js             # matched rules, computed, box model, :hov forcing
-  overlay.js                   # Chrome-style box-model highlight overlay
-  persistence.js               # IndexedDB re-apply, debounced saves, undo/redo history
-  inspector.js                 # picker, tree serialization, DOM ops, message router
-storage/local-db.js            # IndexedDB wrapper (changes + snapshots)
-sidepanel/                     # tree + tabs UI (index.html, panel.js, panel.css)
-styles/content.css             # injected, overlay-only
+src/                             # TypeScript sources — classic scripts, no imports
+  types.d.ts                     # shared types: change records, messages, tree nodes
+  background/service-worker.ts   # opens the side panel, CORS-exempt CSS fetch, navigation events
+  storage/local-db.ts            # IndexedDB wrapper (changes + snapshots)
+  content/
+    selector.ts                  # CSS/XPath selector generation + resolution
+    persistence.ts               # apply/re-apply edits, debounced saves, undo/redo history
+    styles-engine.ts             # matched rules, computed values, box model, :hov forcing
+    overlay.ts                   # Chrome-style box-model highlight
+    inspector.ts                 # picker, tree serialization, DOM edits, message router
+  sidepanel/panel.ts             # the side panel UI
+static/                          # copied to dist/ as-is: manifest, icons, panel HTML/CSS
 ```
+
+The side panel talks to the inspected tab's content script directly (`chrome.tabs.sendMessage`); every request and its response type is listed in `RequestMap` in `src/types.d.ts`.
 
 ## Persistence model
 
@@ -74,10 +82,9 @@ Edits are records keyed `(urlPattern, selector, property)` where `property` is a
 
 ## Permissions
 
-- `activeTab`, `scripting`, `<all_urls>` — inject the inspector everywhere; fetch cross-origin CSS
-- `storage` — preferences
+- `<all_urls>` host access — inject the inspector on any page; fetch cross-origin CSS
 - `sidePanel` — the editor lives there
-- `webNavigation` — SPA route detection
+- `webNavigation` — tell the panel when the inspected tab navigates
 
 No analytics, no telemetry, no remote backend.
 

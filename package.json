@@ -1,0 +1,12 @@
+{
+  "name": "desinspect",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc && cp -R static/. dist/"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.0",
+    "typescript": "^6.0.0"
+  }
+}

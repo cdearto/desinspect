@@ -652,6 +652,7 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   padding: 12px 30px;
   font-weight: 600;
 }
+.box-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .box-edge { color: var(--text-dim); font-size: 10px; }
 
 /* ─── HTML editor ──────────────────────────────────────────────────────── */

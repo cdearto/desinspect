@@ -11,23 +11,36 @@
  * so undo/redo uniformly rolls records back/forward and re-applies the DOM.
  */
 
+type HistoryOp = { id: string; before: ChangeRecord | null; after: ChangeRecord | null };
+type HistoryEntry = { label: string; ops: HistoryOp[]; at: number };
+
+/** Push a message to the side panel (dropped silently if it isn't open). */
+function notifyPanel<T extends ContentPush['type']>(
+  type: T,
+  data: Extract<ContentPush, { type: T }>['data']
+): void {
+  chrome.runtime.sendMessage({ type, data }).catch(() => {});
+}
+
 const Persistence = (() => {
   const DEBOUNCE_MS = 300;
   const STYLESHEET_ID = 'desinspect-overrides';
   let _currentUrl = location.href;
-  const _saveTimers = new Map(); // id → { t: timeoutId, record } — record kept so flush works even if _cache was rebuilt
-  const _cache = new Map(); // id → record (in-memory mirror of IDB for this URL)
+  // Debounced CSS writes. The record rides along so a flush never depends on _cache.
+  const _saveTimers = new Map<string, { t: number; record: ChangeRecord }>();
+  // In-memory mirror of IndexedDB for the current URL.
+  const _cache = new Map<string, ChangeRecord>();
 
   // Which __remove__ records have already been applied this page generation.
   // Without this, positional selectors (li:nth-of-type(2)) would match a NEW
   // sibling after each apply and every reapply would delete one more element.
-  const _appliedRemoves = new Set();
+  const _appliedRemoves = new Set<string>();
 
   // Live-node registry for HTML-edited records. After an outerHTML replace
   // the stored selector may no longer resolve (e.g. span → button), so we
   // remember which live nodes each __html__ record currently owns. A record
   // can own multiple roots (the user replaced one element with several).
-  const _liveEls = new Map(); // record id → Node[] (element roots + text nodes)
+  const _liveEls = new Map<string, ChildNode[]>(); // record id → root nodes (elements + text)
 
   // When we mutate the DOM ourselves, the MutationObserver would otherwise
   // re-fire reapply() in a loop. Mark a settle window after destructive
@@ -41,15 +54,15 @@ const Persistence = (() => {
 
   const MAX_HISTORY = 100;
   const COALESCE_MS = 1000;
-  let _undoStack = []; // Array<{ label, ops: [{id, before, after}], at }>
-  let _redoStack = [];
+  let _undoStack: HistoryEntry[] = [];
+  let _redoStack: HistoryEntry[] = [];
 
-  function isNoopOp(op) {
+  function isNoopOp(op: HistoryOp): boolean {
     if (!op.before && !op.after) return true;
     return !!op.before && !!op.after && JSON.stringify(op.before) === JSON.stringify(op.after);
   }
 
-  function pushHistory(label, ops) {
+  function pushHistory(label: string, ops: HistoryOp[]): void {
     ops = ops.filter((op) => !isNoopOp(op));
     if (!ops.length) return;
     const now = Date.now();
@@ -81,15 +94,16 @@ const Persistence = (() => {
     broadcastUndoState();
   }
 
-  function broadcastUndoState() {
-    notifyPanel('UNDO_STATE', {
-      canUndo: _undoStack.length > 0,
-      canRedo: _redoStack.length > 0,
-    });
+  function getUndoState(): UndoState {
+    return { canUndo: _undoStack.length > 0, canRedo: _redoStack.length > 0 };
+  }
+
+  function broadcastUndoState(): void {
+    notifyPanel('UNDO_STATE', getUndoState());
   }
 
   /** Cancel a pending debounced save so its timer can't resurrect a record. */
-  function cancelTimer(id) {
+  function cancelTimer(id: string): void {
     const pending = _saveTimers.get(id);
     if (pending) {
       clearTimeout(pending.t);
@@ -97,19 +111,21 @@ const Persistence = (() => {
     }
   }
 
-  const isStructural = (record) =>
+  /** HTML replacements and removals change the DOM; everything else is CSS. */
+  const isStructural = (record: ChangeRecord): boolean =>
     record.property === '__html__' || record.property === '__remove__';
 
   const REVERT_FAILED_REASON =
     'Element could not be restored (page may have re-rendered). The change record was kept.';
 
-  async function applyOpDirection(op, useBefore) {
+  /** Move one record to its `before` (undo) or `after` (redo) state. */
+  async function applyOpDirection(op: HistoryOp, useBefore: boolean): Promise<void> {
     cancelTimer(op.id);
     const target = useBefore ? op.before : op.after;
     const other = useBefore ? op.after : op.before;
     if (target) {
       _cache.set(op.id, target);
-      await PersistDB.putChange({ ...target });
+      await PersistDB.putChange(target);
       applyRecord(target);
     } else if (other) {
       // Record is being removed in this direction → unapply from DOM first;
@@ -125,7 +141,7 @@ const Persistence = (() => {
     }
   }
 
-  async function undo() {
+  async function undo(): Promise<{ done: boolean }> {
     const entry = _undoStack.pop();
     if (!entry) return { done: false };
     for (const op of [...entry.ops].reverse()) {
@@ -134,10 +150,10 @@ const Persistence = (() => {
     _redoStack.push(entry);
     broadcastUndoState();
     notifyPanel('HISTORY_APPLIED', { direction: 'undo', label: entry.label });
-    return { done: true, label: entry.label };
+    return { done: true };
   }
 
-  async function redo() {
+  async function redo(): Promise<{ done: boolean }> {
     const entry = _redoStack.pop();
     if (!entry) return { done: false };
     for (const op of entry.ops) {
@@ -146,17 +162,13 @@ const Persistence = (() => {
     _undoStack.push(entry);
     broadcastUndoState();
     notifyPanel('HISTORY_APPLIED', { direction: 'redo', label: entry.label });
-    return { done: true, label: entry.label };
-  }
-
-  function getUndoState() {
-    return { canUndo: _undoStack.length > 0, canRedo: _redoStack.length > 0 };
+    return { done: true };
   }
 
   // ─── Override stylesheet ───────────────────────────────────────────────────
 
-  function getStylesheet() {
-    let el = document.getElementById(STYLESHEET_ID);
+  function getStylesheet(): CSSStyleSheet {
+    let el = document.getElementById(STYLESHEET_ID) as HTMLStyleElement | null;
     if (!el) {
       el = document.createElement('style');
       el.id = STYLESHEET_ID;
@@ -164,19 +176,17 @@ const Persistence = (() => {
       // Last in document order so we win specificity ties.
       document.documentElement.appendChild(el);
     }
-    return el.sheet;
+    return el.sheet!;
   }
 
   // (selector::property) → CSSRule ref. Shorthands (margin, background…)
   // expand to longhands in CSSOM, so "the rule for this property" cannot be
   // recovered from r.style — track inserted rules explicitly instead.
-  const _sheetRules = new Map();
+  const _sheetRules = new Map<string, CSSRule>();
 
-  function sheetRuleKey(selector, property) {
-    return `${selector}::${property}`;
-  }
+  const sheetRuleKey = (selector: string, property: string) => `${selector}::${property}`;
 
-  function removeRuleFromSheet(selector, property) {
+  function removeRuleFromSheet(selector: string, property: string): void {
     const sheet = getStylesheet();
     const key = sheetRuleKey(selector, property);
     const tracked = _sheetRules.get(key);
@@ -191,7 +201,7 @@ const Persistence = (() => {
     }
   }
 
-  function applyRuleToSheet(record) {
+  function applyRuleToSheet(record: ChangeRecord): void {
     const sheet = getStylesheet();
     const ruleSelector = record.selector;
     // Disabled records override with `revert` so the property actually turns
@@ -208,7 +218,7 @@ const Persistence = (() => {
     }
   }
 
-  function wipeSheet() {
+  function wipeSheet(): void {
     const sheet = getStylesheet();
     while (sheet.cssRules.length) sheet.deleteRule(0);
     _sheetRules.clear();
@@ -216,26 +226,26 @@ const Persistence = (() => {
 
   // ─── Record application ────────────────────────────────────────────────────
 
-  function liveNodes(id) {
+  /** The nodes an __html__ record currently owns, if they're all still in the page. */
+  function liveNodes(id: string): ChildNode[] | null {
     const nodes = _liveEls.get(id);
     if (nodes && nodes.length && nodes.every((n) => n.isConnected)) return nodes;
     return null;
   }
 
   /** First live element root a record owns, or null. */
-  function getLiveElement(id) {
-    const nodes = liveNodes(id);
-    return (nodes && nodes.find((n) => n.nodeType === 1)) || null;
+  function getLiveElement(id: string): Element | null {
+    return liveNodes(id)?.find((n) => n instanceof Element) ?? null;
   }
 
-  function findLive(record) {
+  function findLive(record: ChangeRecord): Element | null {
     return (
       getLiveElement(record.id) ||
       SelectorEngine.find({ type: record.selectorType, value: record.selector })
     );
   }
 
-  function parseTemplate(html) {
+  function parseTemplate(html: string): DocumentFragment {
     const tmpl = document.createElement('template');
     tmpl.innerHTML = html;
     return tmpl.content;
@@ -246,11 +256,11 @@ const Persistence = (() => {
    * against live DOM serializations (attribute quoting, entity encoding,
    * boolean attributes, tag case all normalize).
    */
-  function normalizeHtml(html) {
+  function normalizeHtml(html: string): string {
     return serializeNodes(parseTemplate(html).childNodes);
   }
 
-  function serializeNodes(nodes) {
+  function serializeNodes(nodes: Iterable<Node>): string {
     const div = document.createElement('div');
     for (const n of nodes) div.appendChild(n.cloneNode(true));
     return div.innerHTML;
@@ -263,7 +273,12 @@ const Persistence = (() => {
    * copy attributes + children from a DOMParser parse (template parsers
    * silently drop html/body/head tags).
    */
-  function swapElementWithMarkup(el, html, recordId, extraRoots = []) {
+  function swapElementWithMarkup(
+    el: Element,
+    html: string,
+    recordId: string | null,
+    extraRoots: ChildNode[] = []
+  ): void {
     const tag = el.tagName.toLowerCase();
     if (tag === 'html' || tag === 'body' || tag === 'head') {
       const looksWrapped = new RegExp(`<${tag}[\\s>]`, 'i').test(html);
@@ -272,33 +287,31 @@ const Persistence = (() => {
         'text/html'
       );
       const parsedSame = doc.querySelector(tag);
-      if (!parsedSame) return el; // parse failed — leave the DOM alone
+      if (!parsedSame) return; // parse failed — leave the DOM alone
       while (el.attributes.length) el.removeAttribute(el.attributes[0].name);
       for (const a of Array.from(parsedSame.attributes)) el.setAttribute(a.name, a.value);
       el.innerHTML = '';
       el.append(...Array.from(parsedSame.childNodes));
       if (recordId) _liveEls.set(recordId, [el]);
-      return el;
+      return;
     }
     const frag = parseTemplate(html);
-    const first = frag.firstElementChild;
     // Remove any additional roots a previous multi-root apply inserted.
     for (const extra of extraRoots) {
       if (extra !== el && extra.isConnected) extra.remove();
     }
-    if (!first) {
+    if (!frag.firstElementChild) {
       // Text-only replacement — keep the element, swap contents.
       el.innerHTML = html;
       if (recordId) _liveEls.set(recordId, [el]);
-      return el;
+      return;
     }
     const nodes = Array.from(frag.childNodes);
     el.replaceWith(...nodes);
     if (recordId) _liveEls.set(recordId, nodes);
-    return first;
   }
 
-  function applyHtmlChange(record) {
+  function applyHtmlChange(record: ChangeRecord): boolean {
     const tracked = liveNodes(record.id);
     // Idempotence: silent reapplies (MutationObserver settles) must not
     // re-replace an already-applied subtree — that would reset focus and
@@ -317,7 +330,7 @@ const Persistence = (() => {
     return true;
   }
 
-  function unapplyHtmlChange(record) {
+  function unapplyHtmlChange(record: ChangeRecord): boolean {
     if (record.originalValue == null) return false;
     const tracked = liveNodes(record.id);
     const el = findLive(record);
@@ -329,7 +342,7 @@ const Persistence = (() => {
     return true;
   }
 
-  function applyRemoveChange(record) {
+  function applyRemoveChange(record: ChangeRecord): boolean {
     // One removal per record per page generation — positional selectors
     // (li:nth-of-type(2)) match a NEW sibling after the first removal, and
     // repeated silent reapplies would otherwise eat the whole list.
@@ -345,7 +358,7 @@ const Persistence = (() => {
     return true;
   }
 
-  function unapplyRemoveChange(record) {
+  function unapplyRemoveChange(record: ChangeRecord): boolean {
     // Re-insert from stored restore info.
     if (!record.originalValue || !record.parentSelector) return false;
     const parent = SelectorEngine.find({
@@ -353,21 +366,17 @@ const Persistence = (() => {
       value: record.parentSelector,
     });
     if (!parent) return false;
-    markOurMutation();
     const restored = parseTemplate(record.originalValue).firstElementChild;
     if (!restored) return false;
-    const children = Array.from(parent.children);
-    const idx = typeof record.childIndex === 'number' ? record.childIndex : children.length;
-    if (idx >= 0 && idx < children.length) {
-      parent.insertBefore(restored, children[idx]);
-    } else {
-      parent.appendChild(restored);
-    }
+    markOurMutation();
+    // Falls back to appending when the index is past the end (or missing).
+    parent.insertBefore(restored, parent.children[record.childIndex ?? -1] ?? null);
     _appliedRemoves.delete(record.id);
     return true;
   }
 
-  function applyRecord(record) {
+  /** Apply a record to the page. False if its target element couldn't be found. */
+  function applyRecord(record: ChangeRecord): boolean {
     if (record.property === '__html__') return applyHtmlChange(record);
     if (record.property === '__remove__') return applyRemoveChange(record);
     // CSS rule selectors only work in stylesheets; XPath goes inline.
@@ -376,21 +385,23 @@ const Persistence = (() => {
     return true;
   }
 
-  function unapplyRecord(record) {
+  /** Undo a record's effect on the page. False if the DOM couldn't be restored. */
+  function unapplyRecord(record: ChangeRecord): boolean {
     if (record.property === '__html__') return unapplyHtmlChange(record);
     if (record.property === '__remove__') return unapplyRemoveChange(record);
     if (record.selectorType === 'xpath') {
       const el = SelectorEngine.find({ type: 'xpath', value: record.selector });
-      if (el) restoreInlinePrior(el, record);
-      return !!el;
+      if (!(el instanceof HTMLElement || el instanceof SVGElement)) return false;
+      restoreInlinePrior(el, record);
+      return true;
     }
     removeRuleFromSheet(record.selector, record.property);
     return true;
   }
 
-  function applyInlineStyle(record) {
+  function applyInlineStyle(record: ChangeRecord): boolean {
     const el = SelectorEngine.find({ type: record.selectorType, value: record.selector });
-    if (!el) return false;
+    if (!(el instanceof HTMLElement || el instanceof SVGElement)) return false;
     // Capture the page's own inline declaration once so disable/revert can
     // restore it instead of deleting it. Mutating the record here is fine —
     // it's the same object the debounced save persists.
@@ -405,7 +416,7 @@ const Persistence = (() => {
     return true;
   }
 
-  function restoreInlinePrior(el, record) {
+  function restoreInlinePrior(el: HTMLElement | SVGElement, record: ChangeRecord): void {
     if (record.inlinePrior) el.style.setProperty(record.property, record.inlinePrior);
     else el.style.removeProperty(record.property);
   }
@@ -418,7 +429,7 @@ const Persistence = (() => {
    * navigations — instead we poll location.href (and check it whenever
    * the DOM changes). Returns true when the URL pattern actually changed.
    */
-  function handleNavigation() {
+  function handleNavigation(): boolean {
     const newUrl = location.href;
     if (PersistDB.normalizeUrl(newUrl) === PersistDB.normalizeUrl(_currentUrl)) {
       _currentUrl = newUrl;
@@ -437,7 +448,7 @@ const Persistence = (() => {
     return true;
   }
 
-  async function init() {
+  async function init(): Promise<void> {
     await PersistDB.open();
     _currentUrl = location.href;
     await reapply();
@@ -471,8 +482,8 @@ const Persistence = (() => {
   }
 
   /** Cancel every pending save timer and return the records they held. */
-  function takePendingRecords() {
-    const records = [];
+  function takePendingRecords(): ChangeRecord[] {
+    const records: ChangeRecord[] = [];
     for (const entry of _saveTimers.values()) {
       clearTimeout(entry.t);
       records.push(entry.record);
@@ -486,29 +497,31 @@ const Persistence = (() => {
    * starts the transaction synchronously — an awaited write would only begin
    * after the pagehide handler returns, when the page may be tearing down.
    */
-  function flushPendingSaves() {
+  function flushPendingSaves(): void {
     const records = takePendingRecords();
     if (records.length) PersistDB.putChangesSync(records);
   }
 
   /** Awaited flush, for moments that must be durable (snapshot creation). */
-  async function flushNow() {
+  async function flushNow(): Promise<void> {
     await Promise.all(takePendingRecords().map((r) => PersistDB.putChange(r)));
   }
 
-  function debounce(fn, ms, maxWait) {
-    let t = null;
+  /** Trailing debounce that still fires at least every `maxWait` ms under constant calls. */
+  function debounce(fn: () => void, ms: number, maxWait: number): () => void {
+    let t: number | undefined;
     let firstCall = 0;
-    return (...args) => {
+    return () => {
       const now = Date.now();
-      if (!firstCall) firstCall = now;
+      firstCall ||= now;
       clearTimeout(t);
-      const elapsed = now - firstCall;
-      const wait = maxWait && elapsed >= maxWait ? 0 : ms;
-      t = setTimeout(() => {
-        firstCall = 0;
-        fn(...args);
-      }, wait);
+      t = setTimeout(
+        () => {
+          firstCall = 0;
+          fn();
+        },
+        now - firstCall >= maxWait ? 0 : ms
+      );
     };
   }
 
@@ -517,21 +530,22 @@ const Persistence = (() => {
    * structural edits oldest-first so nested HTML edits replay the way they
    * were made, then removals last.
    */
-  function orderRecords(records) {
-    const css = [];
-    const html = [];
-    const removes = [];
+  function orderRecords(records: ChangeRecord[]): ChangeRecord[] {
+    const css: ChangeRecord[] = [];
+    const html: ChangeRecord[] = [];
+    const removes: ChangeRecord[] = [];
     for (const r of records) {
       if (r.property === '__html__') html.push(r);
       else if (r.property === '__remove__') removes.push(r);
       else css.push(r);
     }
-    html.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-    removes.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    html.sort((a, b) => a.timestamp - b.timestamp);
+    removes.sort((a, b) => a.timestamp - b.timestamp);
     return [...css, ...html, ...removes];
   }
 
-  async function reapply({ silent } = {}) {
+  /** Load this URL's records and (re)apply them. `silent` skips notifying the panel. */
+  async function reapply({ silent = false } = {}): Promise<void> {
     try {
       const records = await PersistDB.getChangesForUrl(_currentUrl);
       // Edits saved during the await above exist only in _cache + pending
@@ -548,7 +562,7 @@ const Persistence = (() => {
         applyRecord(r);
       }
       if (!silent) {
-        notifyPanel('CHANGES_LOADED', { url: _currentUrl, changes: Array.from(byId.values()) });
+        notifyPanel('CHANGES_LOADED', { changes: Array.from(byId.values()) });
       }
     } catch (err) {
       console.error('[DesInspect] reapply failed:', err);
@@ -562,16 +576,16 @@ const Persistence = (() => {
    * keystroke); structural edits (__html__/__remove__) are awaited so the
    * caller only resolves once the change is durable.
    */
-  async function saveChange(input) {
+  async function saveChange(input: ChangeInput): Promise<ChangeRecord> {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
-    const id = input.id || `${urlPattern}::${input.selector}::${input.property}`;
+    const id = `${urlPattern}::${input.selector}::${input.property}`;
     const before = _cache.get(id) || null;
     // Canonicalize HTML values so the idempotence check (serialization vs
     // serialization) holds — raw textarea text with unquoted attributes or
     // bare '&' would never byte-match the DOM and cause endless re-swaps.
     const value =
       input.property === '__html__' ? normalizeHtml(input.value) : input.value;
-    const record = {
+    const record: ChangeRecord = {
       ...input,
       value,
       id,
@@ -605,13 +619,14 @@ const Persistence = (() => {
     return record;
   }
 
-  function historyLabel(record) {
+  function historyLabel(record: ChangeRecord): string {
     if (record.property === '__html__') return 'Edit HTML';
     if (record.property === '__remove__') return 'Delete element';
     return `${record.property}: ${record.disabled ? '(off)' : record.value}`;
   }
 
-  async function deleteChange(id) {
+  /** Revert one change. Fails (keeping the record) if a structural edit can't be undone on the page. */
+  async function deleteChange(id: string): Promise<Ok> {
     cancelTimer(id);
     const record = _cache.get(id) || (await PersistDB.getChange(id));
     if (!record) return { ok: true };
@@ -637,7 +652,7 @@ const Persistence = (() => {
    * Delete by (selector, property) — used by the panel when it doesn't have
    * a record id (e.g. cancelling a live-preview edit that created one).
    */
-  function deleteChangeByProp(selector, property) {
+  function deleteChangeByProp(selector: string, property: string): Promise<Ok> {
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
     return deleteChange(`${urlPattern}::${selector}::${property}`);
   }
@@ -647,33 +662,33 @@ const Persistence = (() => {
    * re-inserted, HTML edits restored newest-first, and non-sheet CSS
    * (xpath → inline styles) removed. The override sheet is wiped wholesale.
    */
-  function unapplyAllRecords(records) {
+  function unapplyAllRecords(records: ChangeRecord[]): void {
     for (const r of orderRecords(records).reverse()) {
       if (isStructural(r) || r.selectorType === 'xpath') unapplyRecord(r);
     }
     wipeSheet();
   }
 
-  async function clearAll() {
+  async function clearAll(): Promise<void> {
     takePendingRecords();
     // Ops in apply order so undo (which replays them reversed) restores
     // removals first, then HTML newest-first, then CSS.
     const records = orderRecords(Array.from(_cache.values()));
-    const ops = records.map((r) => ({ id: r.id, before: { ...r }, after: null }));
+    const ops: HistoryOp[] = records.map((r) => ({ id: r.id, before: { ...r }, after: null }));
 
     unapplyAllRecords(records);
 
     await PersistDB.clearChangesForUrl(_currentUrl);
     _cache.clear();
     pushHistory('Revert all', ops);
-    notifyPanel('ALL_CLEARED', { count: records.length });
+    notifyPanel('ALL_CLEARED', {});
   }
 
-  async function restoreSnapshot(snapshotChanges) {
+  /** Replace the URL's current changes with a snapshot's. */
+  async function restoreSnapshot(snapshotChanges: ChangeRecord[]): Promise<void> {
     takePendingRecords();
     const current = orderRecords(Array.from(_cache.values()));
-    const ops = [];
-    for (const r of current) ops.push({ id: r.id, before: { ...r }, after: null });
+    const ops: HistoryOp[] = current.map((r) => ({ id: r.id, before: { ...r }, after: null }));
 
     unapplyAllRecords(current);
     await PersistDB.clearChangesForUrl(_currentUrl);
@@ -681,7 +696,7 @@ const Persistence = (() => {
 
     const urlPattern = PersistDB.normalizeUrl(_currentUrl);
     for (const c of snapshotChanges) {
-      const record = { ...c, urlPattern, timestamp: c.timestamp || Date.now() };
+      const record = { ...c, urlPattern };
       const existing = ops.find((o) => o.id === record.id);
       if (existing) existing.after = { ...record };
       else ops.push({ id: record.id, before: null, after: { ...record } });
@@ -692,15 +707,11 @@ const Persistence = (() => {
       applyRecord(r);
     }
     pushHistory('Restore snapshot', ops);
-    notifyPanel('CHANGES_LOADED', { url: _currentUrl, changes: Array.from(_cache.values()) });
+    notifyPanel('CHANGES_LOADED', { changes: Array.from(_cache.values()) });
   }
 
-  function getCurrentChanges() {
+  function getCurrentChanges(): ChangeRecord[] {
     return Array.from(_cache.values()).sort((a, b) => a.timestamp - b.timestamp);
-  }
-
-  function notifyPanel(type, data) {
-    chrome.runtime.sendMessage({ type, data }).catch(() => {});
   }
 
   return {
@@ -720,4 +731,3 @@ const Persistence = (() => {
   };
 })();
 
-if (typeof window !== 'undefined') window.Persistence = Persistence;
