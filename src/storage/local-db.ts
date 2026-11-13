@@ -90,12 +90,6 @@ const PersistDB = (() => {
     return wrap((await store(STORE_CHANGES)).index('byUrl').getAll(normalizeUrl(url)));
   }
 
-  async function clearChangesForUrl(url: string): Promise<void> {
-    const changes = await getChangesForUrl(url);
-    const s = await store(STORE_CHANGES, 'readwrite');
-    await Promise.all(changes.map((c) => wrap(s.delete(c.id))));
-  }
-
   // ─── Snapshots ─────────────────────────────────────────────────────────────
 
   /** Save the URL's current changes as a named snapshot; returns its id. */
@@ -131,7 +125,6 @@ const PersistDB = (() => {
     deleteChange,
     getChange,
     getChangesForUrl,
-    clearChangesForUrl,
     createSnapshot,
     getSnapshotsForUrl,
     deleteSnapshot,

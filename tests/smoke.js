@@ -58,7 +58,7 @@ const assert = (c, m) => { if (!c) { throw new Error('ASSERT: ' + m); } console.
   assert(await panel.locator('#changes-badge').textContent() === '1', 'changes badge = 1');
 
   console.log('toggle author property');
-  const colorRow = () => panel.locator('#styles .style-rule', { has: panel.locator('.rule-selector', { hasText: /^\.card$/ }) }).first().locator('.prop-row', { has: panel.locator('.prop-name', { hasText: /^color$/ }) });
+  const colorRow = () => panel.locator('#styles .style-rule', { has: panel.locator('.rule-selector', { hasText: /^\.card$/ }) }).locator('.prop-row', { has: panel.locator('.prop-name', { hasText: /^color$/ }) });
   await colorRow().locator('.prop-checkbox').click(); await settle();
   assert(await css('.card', 'color') !== 'rgb(0, 0, 255)', 'unchecked color no longer applies');
   assert(await panel.locator('#styles .rule-selector', { hasText: /^\.card$/ }).count() === 2, 'no duplicate rule row after uncheck');
@@ -140,6 +140,105 @@ const assert = (c, m) => { if (!c) { throw new Error('ASSERT: ' + m); } console.
   assert(await css('.card', 'backgroundColor') !== 'rgb(10, 20, 30)', 'edits for / are not applied on /other');
   await page.evaluate(() => history.pushState({}, '', '/')); await page.waitForTimeout(1500);
   assert(await css('.card', 'backgroundColor') === 'rgb(10, 20, 30)', 'edits re-applied when navigating back');
+
+  // Send a request straight to the content script, as the panel does.
+  const msg = (m) => panel.evaluate(([id, m]) => chrome.tabs.sendMessage(id, m), [tab.id, m]);
+  const pageVal = (fn) => page.evaluate(fn);
+  const ruleBlock = (selectorText) =>
+    panel.locator('#styles .style-rule', { has: panel.locator('.rule-selector', { hasText: new RegExp(`^${selectorText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`) }) });
+  // The panel collapses its tree when the page navigates; re-open a path.
+  const expand = async (...texts) => {
+    for (const t of texts) {
+      const toggle = row(t).locator('.tree-toggle.collapsed');
+      if (await toggle.count()) { await toggle.click(); await settle(); }
+    }
+  };
+  const propRow = (block, name) => block.locator('.prop-row', { has: panel.locator('.prop-name', { hasText: new RegExp(`^${name}$`) }) });
+
+  console.log('duplicate a direct child of <body>');
+  await expand('<body');
+  await row('class="foot"').click({ button: 'right' }); await panel.locator('.ctx-item', { hasText: 'Duplicate element' }).click(); await settle();
+  assert(await pageVal(() => document.querySelectorAll('footer.foot').length) === 2, 'footer duplicated');
+  await pageVal(() => { document.getElementById('app').__mark = 1; });
+  await page.waitForTimeout(3000);
+  assert(await pageVal(() => document.getElementById('app').__mark === 1 && document.body.className === 'page'), 'body is not re-rendered by later re-applies');
+  await panel.keyboard.press('Control+z'); await settle(); await settle();
+  assert(await pageVal(() => document.querySelectorAll('footer.foot').length) === 1, 'undo removes the duplicate');
+
+  console.log('Edit as HTML keeps <body> attributes');
+  await row('<body').dblclick(); await panel.waitForSelector('.tree-edit-textarea');
+  assert((await panel.locator('.tree-edit-textarea').inputValue()).startsWith('<body class="page">'), 'body editor shows its wrapper tag and attributes');
+  await panel.keyboard.press('Escape');
+
+  console.log('second HTML edit keeps the original for Revert');
+  await msg({ type: 'APPLY_HTML', payload: { selector: { type: 'css', value: 'footer.foot' }, value: '<footer class="foot">Edit 1</footer>' } });
+  const second = await msg({ type: 'APPLY_HTML', payload: { selector: { type: 'css', value: 'footer.foot' }, value: '<footer class="foot">Edit 2</footer>' } });
+  assert(await pageVal(() => document.querySelector('footer.foot').textContent) === 'Edit 2', 'second edit applied');
+  await msg({ type: 'REVERT_CHANGE', id: second.data.record.id }); await settle();
+  assert(await pageVal(() => document.querySelector('footer.foot').textContent) === 'Foot', 'Revert returns to the page original, not the first edit');
+
+  console.log('inline (xpath) styles');
+  const titleXPath = { type: 'xpath', value: '//*[@id="title"]' };
+  await msg({ type: 'APPLY_STYLE', payload: { selector: titleXPath, property: 'color', value: 'rgb(255, 0, 0)' } });
+  assert(await css('#title', 'color') === 'rgb(255, 0, 0)', 'inline style applied');
+  await msg({ type: 'APPLY_STYLE', payload: { selector: titleXPath, property: 'color', value: 'rgb(255, 0, 0)', disabled: true } });
+  assert(await css('#title', 'color') === 'rgb(0, 128, 0)', 'disabling restores the page\'s own inline value');
+  await msg({ type: 'APPLY_STYLE', payload: { selector: titleXPath, property: 'color', value: 'rgb(255, 0, 0)' } });
+  await msg({ type: 'REVERT_PROP', selector: titleXPath.value, property: 'color' });
+  assert(await pageVal(() => document.getElementById('title').style.color) === 'rgb(0, 128, 0)', 'revert restores the page\'s own inline value');
+
+  console.log('SPA navigation takes the old route\'s edits back off');
+  await msg({ type: 'APPLY_STYLE', payload: { selector: titleXPath, property: 'color', value: 'rgb(255, 0, 0)' } });
+  await msg({ type: 'DELETE_ELEMENT', selector: { type: 'css', value: 'footer.foot' } }); await settle();
+  assert(await pageVal(() => !document.querySelector('footer.foot')), 'footer deleted on /');
+  await page.evaluate(() => history.pushState({}, '', '/other')); await page.waitForTimeout(1500);
+  assert(await pageVal(() => !!document.querySelector('footer.foot')), 'deleted element is back on /other');
+  assert(await css('#title', 'color') === 'rgb(0, 128, 0)', 'inline style removed on /other');
+  await page.evaluate(() => history.pushState({}, '', '/')); await page.waitForTimeout(1500);
+  assert(await pageVal(() => !document.querySelector('footer.foot')) && await css('#title', 'color') === 'rgb(255, 0, 0)', 'both re-applied back on /');
+
+  console.log('unchecking an added property');
+  await panel.locator('[data-tab="styles"]').click(); // the snapshot checks left another tab open
+  await expand('<body', 'id="app"');
+  await row('class="card"').click(); await settle();
+  const elementStyle = ruleBlock('element.style');
+  await elementStyle.locator('.prop-add').click();
+  await panel.keyboard.type('color'); await panel.keyboard.press('Tab'); await panel.keyboard.type('rgb(200, 0, 0)'); await panel.keyboard.press('Enter'); await settle();
+  assert(await css('.card', 'color') === 'rgb(200, 0, 0)', 'added color applied');
+  await propRow(elementStyle, 'color').locator('.prop-checkbox').click(); await settle();
+  assert(await css('.card', 'color') === 'rgb(0, 0, 255)', 'unchecking it falls back to the page\'s own color');
+
+  console.log('typed !important and emptied values');
+  await elementStyle.locator('.prop-add').click();
+  await panel.keyboard.type('outline-style'); await panel.keyboard.press('Tab'); await panel.keyboard.type('dotted !important'); await panel.keyboard.press('Enter'); await settle();
+  assert(await css('.card', 'outlineStyle') === 'dotted', 'a value typed with !important still applies');
+  await propRow(elementStyle, 'outline-style').locator('.prop-value').click();
+  await panel.keyboard.press('Control+a'); await panel.keyboard.press('Delete'); await panel.keyboard.press('Enter'); await settle();
+  assert(await css('.card', 'outlineStyle') === 'none' && await propRow(elementStyle, 'outline-style').count() === 0, 'emptying an added value removes the property');
+
+  console.log('rename a property, then Tab to its value');
+  await expand('class="card"');
+  await row('class="btn"').click(); await settle();
+  await propRow(ruleBlock('.btn'), 'color').locator('.prop-name').click();
+  await panel.keyboard.press('Control+a'); await panel.keyboard.type('background-color'); await panel.keyboard.press('Tab'); await settle();
+  await panel.keyboard.type('rgb(0, 100, 0)'); await panel.keyboard.press('Enter'); await settle();
+  assert(await css('.btn', 'backgroundColor') === 'rgb(0, 100, 0)', 'the value goes to the renamed property');
+  assert(await css('.btn', 'color') !== 'rgb(0, 100, 0)', 'the old property is not overwritten');
+
+  console.log('Revert all keeps what it cannot restore');
+  await msg({ type: 'DELETE_ELEMENT', selector: { type: 'css', value: '#box > i.x' } }); await settle();
+  await pageVal(() => document.getElementById('box').remove()); // the page re-renders the parent away
+  await msg({ type: 'REVERT_ALL' }); await settle();
+  const kept = (await msg({ type: 'GET_CHANGES' })).data.changes;
+  assert(kept.length === 1 && kept[0].property === '__remove__', 'the unrestorable delete is kept; everything else is reverted');
+
+  console.log('cascade strikethrough');
+  await row('class="note"').click(); await settle();
+  const noteColors = panel.locator('#styles .prop-row', { has: panel.locator('.prop-name', { hasText: /^color$/ }) });
+  const struck = async (value) => (await noteColors.filter({ hasText: value }).first().getAttribute('class')).includes('overridden');
+  assert(!(await struck('rgb(2, 2, 2)')), 'the later of two equal rules wins');
+  assert(await struck('rgb(1, 1, 1)'), 'the earlier one is struck through');
+  assert(!(await struck('rgb(3, 3, 3)')) && !(await struck('rgb(4, 4, 4)')), ':hover and ::before rules neither win nor lose');
 
   console.log(errors.length ? 'CONSOLE ERRORS:\n' + errors.join('\n') : '\nAll checks passed.');
   await ctx.close(); server.close();

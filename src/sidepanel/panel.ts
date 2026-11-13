@@ -498,7 +498,6 @@
         payload: {
           selector: node.selector,
           value: newHtml,
-          originalValue: raw,
           elementLabel: node.selector.value,
         },
       });
@@ -868,13 +867,23 @@
       else rule.properties.push({ ...merged, added: true });
     }
 
-    // Approximate the cascade: the topmost enabled occurrence of a property
-    // wins, later ones are struck through.
-    const seen = new Set<string>();
-    for (const p of rules.flatMap((r) => r.properties)) {
+    // Strike through what loses the cascade. Rules arrive most-specific
+    // first (element.style, then by specificity and source order), so the
+    // first enabled declaration of a name wins — unless a later one is
+    // !important and the winner isn't. Rules that only apply in a state
+    // (:hover, ::before) don't take part.
+    const winners = new Map<string, PanelProp>();
+    for (const p of rules.filter((r) => !r.pseudo).flatMap((r) => r.properties)) {
       if (p.disabled) continue;
-      if (seen.has(p.name)) p.overridden = true;
-      else seen.add(p.name);
+      const current = winners.get(p.name);
+      if (!current) {
+        winners.set(p.name, p);
+      } else if (p.important && !current.important) {
+        current.overridden = true;
+        winners.set(p.name, p);
+      } else {
+        p.overridden = true;
+      }
     }
 
     const filter = $<HTMLInputElement>('style-filter').value.toLowerCase();
@@ -902,6 +911,8 @@
     body.append(makeAddPropertyRow(rule));
 
     const block = el('div', 'style-rule');
+    block.dataset.kind = rule.kind;
+    block.dataset.target = rule.targetSelector;
     block.append(head, body);
     return block;
   }
@@ -959,7 +970,12 @@
       : { type: rule.targetType || 'css', value: rule.targetSelector };
   }
 
-  function applyStyle(rule: RuleTarget, property: string, value: string, flags: { disabled?: boolean; authorDisable?: boolean } = {}) {
+  function applyStyle(
+    rule: RuleTarget,
+    property: string,
+    value: string,
+    flags: { disabled?: boolean; authorDisable?: boolean; added?: boolean } = {}
+  ) {
     return send('APPLY_STYLE', {
       payload: { selector: selectorFor(rule), property, value, elementLabel: state.selected?.value, ...flags },
     });
@@ -981,17 +997,19 @@
     const oldName = p.name;
     beginEdit(span);
 
-    const commit = async () => {
+    let done = false;
+    /** Save the rename; resolves to the property's name afterwards. */
+    const commit = async (): Promise<string> => {
+      if (done) return oldName;
+      done = true;
       span.contentEditable = 'false';
-      span.removeEventListener('blur', commit);
-      span.removeEventListener('keydown', onKey);
       const newName = (span.textContent || '').trim().toLowerCase();
       if (newName === oldName || !newName) {
         span.textContent = oldName;
-        return;
+        return oldName;
       }
-      if (p.edited) {
-        // Our own change record — genuinely delete the old one.
+      if (p.added) {
+        // Only exists as our change — delete it outright.
         await send('REVERT_PROP', { selector: rule.targetSelector, property: oldName });
       } else {
         // Author CSS can't be deleted; renaming means "turn the old
@@ -999,22 +1017,36 @@
         await applyStyle(rule, oldName, p.value, { disabled: true, authorDisable: true });
       }
       await saveStyleEdit(rule, newName, p.value);
+      return newName;
     };
-    const onKey = (e: KeyboardEvent) => {
+    span.addEventListener('blur', commit);
+    span.addEventListener('keydown', async (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         span.blur();
       } else if (e.key === 'Tab') {
+        // Move on to the value — of the renamed property, which lives in a
+        // freshly rendered row once the rename is saved.
         e.preventDefault();
-        span.blur();
-        editPropValue(valueSpan, p, rule);
+        const name = await commit();
+        if (name === oldName) editPropValue(valueSpan, p, rule);
+        else findValueSpan(rule, name)?.click();
       } else if (e.key === 'Escape') {
         span.textContent = oldName;
         span.blur();
       }
-    };
-    span.addEventListener('blur', commit);
-    span.addEventListener('keydown', onKey);
+    });
+  }
+
+  /** The value cell of `property` in the rendered block for `rule`. */
+  function findValueSpan(rule: RuleTarget, property: string): HTMLElement | null {
+    const block = Array.from(document.querySelectorAll<HTMLElement>('#styles .style-rule')).find(
+      (b) => b.dataset.kind === rule.kind && b.dataset.target === rule.targetSelector
+    );
+    const row = Array.from(block?.querySelectorAll('.prop-row') ?? []).find(
+      (r) => r.querySelector('.prop-name')?.textContent === property
+    );
+    return row?.querySelector<HTMLElement>('.prop-value') ?? null;
   }
 
   /**
@@ -1037,7 +1069,15 @@
       if (finished) return;
       finish();
       const newVal = (span.textContent || '').trim();
-      if (newVal !== oldVal) saveStyleEdit(rule, p.name, newVal);
+      if (newVal) {
+        if (newVal !== oldVal) saveStyleEdit(rule, p.name, newVal);
+      } else if (p.added) {
+        // Emptied a property that only exists as our change — remove it.
+        send('REVERT_PROP', { selector: rule.targetSelector, property: p.name }).then(refreshStyles);
+      } else {
+        // Emptied a declaration the page has — switch it off.
+        applyStyle(rule, p.name, oldVal, { disabled: true, authorDisable: true }).then(refreshStyles);
+      }
     };
     const cancel = async () => {
       if (finished) return;
@@ -1045,7 +1085,7 @@
       span.textContent = oldVal;
       if (p.edited) {
         // There was a saved change before this edit — restore it as it was.
-        await applyStyle(rule, p.name, oldVal, { disabled: p.disabled, authorDisable: p.authorDisable });
+        await applyStyle(rule, p.name, oldVal, { disabled: p.disabled, authorDisable: p.authorDisable, added: p.added });
       } else {
         await send('REVERT_PROP', { selector: rule.targetSelector, property: p.name });
       }
@@ -1191,7 +1231,7 @@
    */
   async function toggleProp(rule: RuleTarget, p: PanelProp, disabled: boolean): Promise<void> {
     if (disabled) {
-      await applyStyle(rule, p.name, p.value, { disabled: true, authorDisable: !p.edited });
+      await applyStyle(rule, p.name, p.value, { disabled: true, authorDisable: !p.edited, added: p.added });
     } else if (p.authorDisable && p.id) {
       await send('REVERT_CHANGE', { id: p.id });
     } else {
@@ -1314,8 +1354,6 @@
 
   /** Re-indent markup for the HTML editor: one element per line, short text kept inline. */
   function prettyHtml(html: string): string {
-    const tmpl = document.createElement('template');
-    tmpl.innerHTML = html.trim();
     const squash = (text: string) => text.replace(/\s+/g, ' ').trim();
     const escapeText = (text: string) => text.replace(/[&<>]/g, (c) => HTML_ESCAPES[c]);
 
@@ -1340,6 +1378,15 @@
       return `${open}\n${children.map((c) => emit(c, depth + 1)).join('')}${pad}</${tag}>\n`;
     }
 
+    // <html>/<head>/<body> need a full-document parse — a <template> drops
+    // those tags, and with them the element's attributes.
+    const root = /^\s*<(html|head|body)[\s>]/i.exec(html)?.[1].toLowerCase();
+    if (root) {
+      const parsed = new DOMParser().parseFromString(html, 'text/html').querySelector(root);
+      if (parsed) return emit(parsed, 0).trimEnd();
+    }
+    const tmpl = document.createElement('template');
+    tmpl.innerHTML = html.trim();
     return Array.from(tmpl.content.childNodes, (c) => emit(c, 0)).join('').trimEnd();
   }
 

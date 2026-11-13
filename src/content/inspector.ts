@@ -187,38 +187,24 @@
 
   // ─── Edits ─────────────────────────────────────────────────────────────────
 
-  function applyStyleEdit({ selector, property, value, disabled, authorDisable, elementLabel }: StyleEditPayload) {
+  function applyStyleEdit({ selector, elementLabel, ...edit }: StyleEditPayload) {
     return Persistence.saveChange({
+      ...edit,
       selector: selector.value,
       selectorType: selector.type,
-      property,
-      value,
-      disabled: !!disabled,
-      // Marks records that exist ONLY because the user unchecked an author
-      // property — re-checking those should delete the record, while
-      // re-checking a real edit should restore its value.
-      authorDisable: !!authorDisable,
       elementTag: _selected?.tagName?.toLowerCase() || null,
       elementLabel: elementLabel || null,
     });
   }
 
-  async function applyHtmlEdit({ selector, value, originalValue, elementLabel }: HtmlEditPayload) {
-    // Remember whether the edit target IS the current selection — a
-    // descendant of the edited node also gets disconnected, and adopting
-    // the ancestor in that case would desync overlay vs Styles pane.
+  async function applyHtmlEdit({ selector, value, elementLabel }: HtmlEditPayload) {
+    // Clear forced states so marker classes can't end up in the saved HTML.
+    await StylesEngine.forceStates(null, []);
     const target = SelectorEngine.find(selector);
-    const editedWasSelection = !!target && target === _selected;
+    if (!target) throw new Error('element not found');
+    const editedWasSelection = target === _selected;
 
-    const record = await Persistence.saveChange({
-      selector: selector.value,
-      selectorType: selector.type,
-      property: '__html__',
-      value,
-      originalValue,
-      elementTag: target?.tagName?.toLowerCase() || null,
-      elementLabel: elementLabel || null,
-    });
+    const record = await Persistence.saveHtmlEdit(target, value, selector, elementLabel);
     // The replacement element may have a different tag/id/class, so the old
     // selector can be stale. Hand the panel a fresh one, and re-point the
     // page-side selection if it was the node that just got replaced.
@@ -267,27 +253,15 @@
   }
 
   /**
-   * Duplicate an element: insert a clone after it, persisted as an
-   * __html__ edit on the parent (its outerHTML captures the duplication).
+   * Duplicate an element: persisted as an HTML edit replacing the element
+   * with two copies of itself.
    */
   async function duplicateElement(selectorObj: Selector): Promise<Ok> {
     // Clear forced states so marker classes can't end up in the saved HTML.
     await StylesEngine.forceStates(null, []);
     const el = SelectorEngine.find(selectorObj);
     if (!el || !el.parentElement) return { ok: false, error: 'element not found' };
-    const parent = el.parentElement;
-    const parentSel = SelectorEngine.generate(parent);
-    const before = parent.outerHTML;
-    Persistence.markOurMutation();
-    el.insertAdjacentHTML('afterend', el.outerHTML);
-    await Persistence.saveChange({
-      selector: parentSel.value,
-      selectorType: parentSel.type,
-      property: '__html__',
-      value: parent.outerHTML,
-      originalValue: before,
-      elementTag: parent.tagName.toLowerCase(),
-    });
+    await Persistence.saveHtmlEdit(el, el.outerHTML + el.outerHTML, selectorObj);
     return { ok: true };
   }
 

@@ -211,20 +211,64 @@ const StylesEngine = (() => {
     });
   }
 
-  /** Author rules matching `el`, in document order. */
+  /** Split a selector list on its top-level commas. */
+  function splitSelectorList(list: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < list.length; i++) {
+      const ch = list[i];
+      if (ch === '(' || ch === '[') depth++;
+      else if (ch === ')' || ch === ']') depth--;
+      else if (ch === ',' && depth === 0) {
+        parts.push(list.slice(start, i));
+        start = i + 1;
+      }
+    }
+    parts.push(list.slice(start));
+    return parts.map((p) => p.trim());
+  }
+
+  /**
+   * Approximate specificity of one complex selector as a single number
+   * (ids, then classes/attributes/pseudo-classes, then types/pseudo-elements).
+   * :where() counts zero; :is()/:not()/:has() count their contents.
+   */
+  function specificity(selector: string): number {
+    const s = selector
+      .replace(/\[[^\]]*\]/g, '[]') // attribute values can contain anything
+      .replace(/:where\([^)]*\)/g, '');
+    const ids = (s.match(/#[\w-]+/g) || []).length;
+    const classes = (s.match(/\.[\w-]+|\[\]|(?<!:):(?!:|is\(|not\(|has\()[\w-]+/g) || []).length;
+    const types = (s.match(/(?:^|[\s>+~(,])[a-zA-Z][\w-]*|::[\w-]+/g) || []).length;
+    return ids * 1e6 + classes * 1e3 + types;
+  }
+
+  /**
+   * Author rules matching `el`, in cascade order: highest specificity first,
+   * later rules first among equals (a later rule beats an earlier one).
+   * Specificity is that of the most specific selector in the list that matches.
+   */
   async function matchedRules(el: Element): Promise<MatchedRule[]> {
-    const out: MatchedRule[] = [];
+    const found: { rule: MatchedRule; specificity: number }[] = [];
     await walkAllSheets((rule, source, media) => {
       const pseudo = matchPseudo(el, rule.selectorText);
       if (pseudo === null) return;
-      out.push({
-        selector: rule.selectorText,
-        pseudo: pseudo || null,
-        source: media ? `${source} ${media}` : source,
-        properties: parseProps(ruleBody(rule.cssText)),
+      const matching = splitSelectorList(rule.selectorText).filter((part) => matchPseudo(el, part) !== null);
+      found.push({
+        specificity: Math.max(0, ...matching.map(specificity)),
+        rule: {
+          selector: rule.selectorText,
+          pseudo: pseudo || null,
+          source: media ? `${source} ${media}` : source,
+          properties: parseProps(ruleBody(rule.cssText)),
+        },
       });
     });
-    return out;
+    return found
+      .reverse() // later rules first; the stable sort keeps that among equal specificity
+      .sort((a, b) => b.specificity - a.specificity)
+      .map((f) => f.rule);
   }
 
   // ─── Force element state (:hov) ────────────────────────────────────────────

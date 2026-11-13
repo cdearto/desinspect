@@ -25,6 +25,8 @@ interface ChangeRecord {
   disabled?: boolean;
   /** CSS only: the record exists solely because an author property was unchecked. */
   authorDisable?: boolean;
+  /** CSS only: the page's own CSS doesn't declare this property here (the user added it). */
+  added?: boolean;
   /** XPath CSS records are applied inline; the page's own inline value, for restoring. */
   inlinePrior?: string;
   /** __html__ / __remove__: the markup before the edit. */
@@ -111,13 +113,13 @@ interface StyleEditPayload {
   value: string;
   disabled?: boolean;
   authorDisable?: boolean;
+  added?: boolean;
   elementLabel?: string | null;
 }
 
 interface HtmlEditPayload {
   selector: Selector;
   value: string;
-  originalValue: string;
   elementLabel?: string | null;
 }
 
