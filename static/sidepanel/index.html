@@ -36,6 +36,7 @@
     <div id="tree" class="tree" role="tree" tabindex="0">
       <div class="tree-empty">Click <strong>Pick</strong> or expand the tree.</div>
     </div>
+    <div id="breadcrumbs" class="breadcrumbs" aria-label="Element path"></div>
   </section>
 
   <!-- Resizer -->
@@ -46,8 +47,6 @@
     <div class="tabs" role="tablist">
       <button data-tab="styles" class="tab active" role="tab" aria-selected="true">Styles</button>
       <button data-tab="computed" class="tab" role="tab">Computed</button>
-      <button data-tab="box" class="tab" role="tab">Box</button>
-      <button data-tab="html" class="tab" role="tab">HTML</button>
       <button data-tab="changes" class="tab" role="tab">Changes <span id="changes-badge" class="badge"></span></button>
       <button data-tab="snapshots" class="tab" role="tab">Snapshots</button>
     </div>
@@ -55,8 +54,16 @@
     <div class="tab-panels">
       <div class="tab-panel active" data-panel="styles">
         <div class="filter-row">
-          <input id="style-filter" type="text" placeholder="Filter properties" />
-          <button id="btn-add-rule" class="link-btn">+ New rule</button>
+          <input id="style-filter" type="text" placeholder="Filter" />
+          <button id="btn-hov" class="link-btn" title="Force element state">:hov</button>
+          <button id="btn-add-rule" class="link-btn" title="New style rule">+</button>
+        </div>
+        <div id="hov-row" class="hov-row" hidden>
+          <label class="check"><input type="checkbox" data-state="hover" /> :hover</label>
+          <label class="check"><input type="checkbox" data-state="focus" /> :focus</label>
+          <label class="check"><input type="checkbox" data-state="focus-within" /> :focus-within</label>
+          <label class="check"><input type="checkbox" data-state="focus-visible" /> :focus-visible</label>
+          <label class="check"><input type="checkbox" data-state="active" /> :active</label>
         </div>
         <div id="styles" class="styles-list">
           <div class="empty">Select an element to view its styles.</div>
@@ -64,6 +71,9 @@
       </div>
 
       <div class="tab-panel" data-panel="computed">
+        <div id="box" class="box-wrap">
+          <div class="empty">No selection.</div>
+        </div>
         <div class="filter-row">
           <input id="computed-filter" type="text" placeholder="Filter" />
           <label class="check"><input id="computed-show-all" type="checkbox" /> show all</label>
@@ -71,20 +81,6 @@
         <div id="computed" class="computed-list">
           <div class="empty">No selection.</div>
         </div>
-      </div>
-
-      <div class="tab-panel" data-panel="box">
-        <div id="box" class="box-wrap">
-          <div class="empty">No selection.</div>
-        </div>
-      </div>
-
-      <div class="tab-panel" data-panel="html">
-        <div class="filter-row">
-          <span class="muted">Edit innerHTML</span>
-          <button id="btn-apply-html" class="link-btn primary">Apply (⌘↵)</button>
-        </div>
-        <textarea id="html-editor" spellcheck="false" placeholder="Select an element..."></textarea>
       </div>
 
       <div class="tab-panel" data-panel="changes">
@@ -105,6 +101,12 @@
     </div>
   </section>
 </main>
+
+<!-- Context menu for tree rows -->
+<div id="ctx-menu" class="ctx-menu" hidden></div>
+
+<!-- Property-name autocomplete -->
+<datalist id="css-props"></datalist>
 
 <script src="panel.js"></script>
 </body>

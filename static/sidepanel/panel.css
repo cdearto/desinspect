@@ -217,6 +217,8 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
 }
 .tree-row:hover { background: var(--bg-row-hover); }
 .tree-row.selected { background: var(--bg-row-selected); }
+.tree:focus { outline: none; }
+.tree:focus .tree-row.selected { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 .tree-indent { display: inline-block; }
 .tree-toggle {
@@ -251,6 +253,135 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
 }
 .tree-children {
   padding-left: 14px;
+}
+
+/* Inline outerHTML editor (double-click on a tree row) */
+.tree-row.editing {
+  background: var(--bg-alt);
+  cursor: default;
+  display: flex;
+  align-items: stretch;
+  padding: 4px 8px;
+}
+.tree-edit-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tree-edit-textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 6px 8px;
+  resize: vertical;
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  tab-size: 2;
+}
+.tree-edit-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 10px;
+}
+
+/* ─── Breadcrumbs ───────────────────────────────────────────────────────── */
+
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  flex-shrink: 0;
+  min-height: 22px;
+  padding: 2px 8px;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+.breadcrumbs::-webkit-scrollbar { display: none; }
+.breadcrumbs:empty { display: none; }
+.crumb {
+  color: var(--text-dim);
+  padding: 1px 4px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.crumb:hover { background: var(--bg-row-hover); color: var(--text); }
+.crumb.current { color: var(--accent); }
+.crumb-sep { color: var(--text-muted); }
+
+/* ─── Context menu ──────────────────────────────────────────────────────── */
+
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 180px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  font-size: 11px;
+}
+.ctx-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 5px 12px;
+  text-align: left;
+  color: var(--text);
+  cursor: pointer;
+}
+.ctx-item:hover { background: var(--bg-row-selected); }
+.ctx-item .ctx-key { color: var(--text-muted); font-size: 10px; }
+.ctx-item.danger { color: var(--danger); }
+.ctx-sep { height: 1px; background: var(--border-subtle); margin: 4px 0; }
+
+/* ─── Force-state row ───────────────────────────────────────────────────── */
+
+.hov-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--mono);
+}
+/* An author `display` beats the UA's [hidden] rule — without this guard the
+ * :hov toggle button would be a no-op and the row permanently visible. */
+.hov-row[hidden] { display: none; }
+.hov-row .check { font-size: 10px; }
+.link-btn.active { background: var(--accent); color: var(--bg); }
+
+/* ─── New rule editor ───────────────────────────────────────────────────── */
+
+.new-rule-selector {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--selector);
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 2px 6px;
+  outline: none;
 }
 
 /* ─── Tabs ──────────────────────────────────────────────────────────────── */
@@ -360,6 +491,15 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   white-space: nowrap;
   padding-left: 8px;
 }
+.rule-pseudo {
+  color: var(--warning);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 0 6px;
+  background: rgba(249, 168, 37, 0.12);
+  border-radius: 2px;
+  margin-left: 4px;
+}
 .rule-body {
   padding: 0 8px 0 8px;
 }
@@ -408,6 +548,20 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   outline: 1px solid var(--accent);
   background: var(--bg-alt);
 }
+.prop-edit-input {
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  min-width: 60px;
+  max-width: 160px;
+  outline: none;
+}
+.prop-edit-input.prop-name { color: var(--prop-name); flex: 0 0 auto; }
+.prop-edit-input.prop-value { color: var(--prop-value); flex: 1; min-width: 80px; }
 .prop-important { color: var(--warning); font-size: 10px; }
 .prop-color-swatch {
   display: inline-block;
@@ -459,12 +613,14 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
 /* ─── Box model ────────────────────────────────────────────────────────── */
 
 .box-wrap {
-  flex: 1;
+  flex: 0 0 auto;
   overflow: auto;
   padding: 12px;
   display: flex;
   justify-content: center;
   align-items: flex-start;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-alt);
 }
 
 .box-diagram {
@@ -496,24 +652,11 @@ input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: va
   padding: 12px 30px;
   font-weight: 600;
 }
+.box-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .box-edge { color: var(--text-dim); font-size: 10px; }
 
 /* ─── HTML editor ──────────────────────────────────────────────────────── */
 
-#html-editor {
-  flex: 1;
-  width: 100%;
-  border: none;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.5;
-  padding: 8px 12px;
-  resize: none;
-  user-select: text;
-  border-radius: 0;
-}
 
 /* ─── Changes & Snapshots lists ────────────────────────────────────────── */
 

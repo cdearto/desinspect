@@ -1,0 +1,8 @@
+.card { color: rgb(0, 0, 255); padding: 8px; content: "a;b"; }
+.btn { color: rgb(1, 2, 3); }
+.btn:hover { color: rgb(255, 0, 0); }
+.btn:focus-visible { outline: 2px solid red; }
+.note { color: rgb(1, 1, 1); }
+.note { color: rgb(2, 2, 2); }
+.note:hover { color: rgb(3, 3, 3); }
+.note::before { content: ""; color: rgb(4, 4, 4); }

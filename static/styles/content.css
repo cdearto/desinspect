@@ -1,0 +1,6 @@
+/* DesInspect overlay — everything else is styled inline by overlay.js. */
+
+#desinspect-overlay-root,
+#desinspect-overlay-root * {
+  box-sizing: border-box !important;
+}

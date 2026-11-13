@@ -1,0 +1,14 @@
+{
+  "name": "desinspect",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc && cp -R static/. dist/",
+    "test": "npm run build && node tests/smoke.js"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.0",
+    "playwright": "1.63.0",
+    "typescript": "^6.0.0"
+  }
+}

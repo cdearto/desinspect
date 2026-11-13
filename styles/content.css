@@ -1,7 +1,0 @@
-/* DesInspect overlay & override styles — kept minimal to avoid leaking. */
-
-#desinspect-overlay-root,
-#desinspect-overlay-root * {
-  font-family: -apple-system, "SF Pro Text", system-ui, sans-serif !important;
-  box-sizing: border-box !important;
-}
