@@ -2,7 +2,15 @@
 
 > A persistent, Chrome-DevTools-style element inspector for any webpage. Edit CSS or HTML, refresh, log in, navigate — your work survives.
 
+![DesInspect on a live site: pick the headline, change its size and color, reload, and the edits come back.](docs/demo.gif)
+
+The same recording as [video](docs/demo.mp4).
+
 DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools Elements panel inside the browser's side panel, then quietly writes every edit to IndexedDB scoped to the page's URL. When you come back — after a refresh, a re-login, or an SPA route change — your tweaks are still there.
+
+## Why I built it
+
+I'm a designer. When I review UI on a live site, I tweak styles in DevTools to try a fix, and every refresh wipes it. DesInspect keeps those edits across reloads, logins and route changes, so I can work a design problem in the browser and come back to it.
 
 ## Features
 
