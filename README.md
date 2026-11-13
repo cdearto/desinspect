@@ -1,12 +1,12 @@
 # DesInspect
 
-> A persistent, Chrome-DevTools-style element inspector for any webpage. Edit CSS or HTML, refresh, log in, navigate — your work survives.
+> A persistent, Chrome-DevTools-style element inspector for any webpage. Edit CSS or HTML, refresh, log in, navigate: your work survives.
 
 ![DesInspect on a live site: pick the headline, change its size and color, reload, and the edits come back.](docs/demo.gif)
 
 The same recording as [video](docs/demo.mp4).
 
-DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools Elements panel inside the browser's side panel, then quietly writes every edit to IndexedDB scoped to the page's URL. When you come back — after a refresh, a re-login, or an SPA route change — your tweaks are still there.
+DesInspect is a Chrome extension (Manifest V3) that mirrors the Chrome DevTools Elements panel inside the browser's side panel, then quietly writes every edit to IndexedDB scoped to the page's URL. When you come back (after a refresh, a re-login, or an SPA route change), your tweaks are still there.
 
 ## Why I built it
 
@@ -17,11 +17,11 @@ I'm a designer. When I review UI on a live site, I tweak styles in DevTools to t
 - **DevTools-style sidepanel**: collapsible DOM tree on top, tabbed inspector below (Styles · Computed · Box · HTML · Changes · Snapshots).
 - **Styles tab** with matched author rules, inline `element.style`, click-to-edit names/values, checkbox toggle per property, color swatches, and `+ add property` / `+ New rule`.
 - **Box-model diagram** showing margin / border / padding / content for the selected element.
-- **HTML editor** — edit innerHTML and apply with `Cmd/Ctrl + Enter`.
-- **Pick mode** — hover the page to highlight, click to select. ESC exits.
-- **Persistent auto-save** — every edit lands in IndexedDB, scoped to `origin + pathname`. Cleared session? Page refresh? Your work is re-applied automatically.
-- **SPA-aware** — hooks `pushState` / `replaceState` / `popstate` and `webNavigation` so your edits re-apply after client-side route changes.
-- **Snapshots** — named save points of the full changeset, restorable in one click.
+- **HTML editor**: edit innerHTML and apply with `Cmd/Ctrl + Enter`.
+- **Pick mode**: hover the page to highlight, click to select. ESC exits.
+- **Persistent auto-save**: every edit lands in IndexedDB, scoped to `origin + pathname`. Cleared session? Page refresh? Your work is re-applied automatically.
+- **SPA-aware**: hooks `pushState` / `replaceState` / `popstate` and `webNavigation` so your edits re-apply after client-side route changes.
+- **Snapshots**: named save points of the full changeset, restorable in one click.
 
 ## Install (unpacked)
 
@@ -34,10 +34,10 @@ I'm a designer. When I review UI on a live site, I tweak styles in DevTools to t
 ## Use
 
 1. Open any page.
-2. Click the DesInspect toolbar icon — the side panel opens.
+2. Click the DesInspect toolbar icon. The side panel opens.
 3. Hit **Pick** (or just expand the DOM tree) and click an element.
 4. Edit styles in the **Styles** tab, edit markup in **HTML**, or check the **Box** model.
-5. Refresh — your edits are still there.
+5. Refresh. Your edits are still there.
 
 ### Keyboard shortcuts
 
@@ -78,13 +78,13 @@ Re-apply triggers:
 
 ## Permissions
 
-- `activeTab`, `scripting`, `<all_urls>` — inject the inspector everywhere.
-- `storage` — preferences.
-- `sidePanel` — the editor lives there.
-- `webNavigation` — SPA route detection.
+- `activeTab`, `scripting`, `<all_urls>`: inject the inspector everywhere.
+- `storage`: preferences.
+- `sidePanel`: the editor lives there.
+- `webNavigation`: SPA route detection.
 
 No network, no telemetry, no remote backend.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
